@@ -21,9 +21,6 @@ pub(super) fn handle_tool_call(app: &mut App, tc: model::ToolCall) {
     let tool_info = build_tool_info_from_tool_call(app, tc, sdk_tool_name, &scope);
     log_command_started(app, &tool_info);
     log_terminal_spawned(app, &tool_info, "initial");
-    if should_jump_on_large_write(&tool_info) {
-        app.viewport.engage_auto_scroll();
-    }
     upsert_tool_call_into_assistant_message(app, tool_info);
 
     app.status = AppStatus::Running;
@@ -184,12 +181,6 @@ fn build_tool_info_from_tool_call(
         terminal_output_len: 0,
         terminal_bytes_seen: 0,
         terminal_snapshot_mode: crate::app::TerminalSnapshotMode::AppendOnly,
-        render_epoch: 0,
-        layout_epoch: 0,
-        last_measured_width: 0,
-        last_measured_height: 0,
-        last_measured_layout_epoch: 0,
-        last_measured_layout_generation: 0,
         cache: BlockCache::default(),
         pending_permission: None,
         pending_question: None,
@@ -287,7 +278,7 @@ fn update_existing_tool_call(app: &mut App, mi: usize, bi: usize, tool_info: &To
             );
         }
         if changed {
-            existing.mark_tool_call_layout_dirty();
+            existing.invalidate_render_cache();
             layout_dirty = true;
         } else {
             crate::perf::mark("tool_update_noop_skips");
@@ -398,22 +389,6 @@ pub(super) fn shorten_tool_title(title: &str, cwd_raw: &str) -> String {
         return title_norm.replace(&with_sep, "");
     }
     title_norm
-}
-
-pub(super) const WRITE_DIFF_JUMP_THRESHOLD_LINES: usize = 40;
-
-pub(super) fn should_jump_on_large_write(tc: &ToolCallInfo) -> bool {
-    if tc.sdk_tool_name != "Write" {
-        return false;
-    }
-    tc.content.iter().any(|c| match c {
-        model::ToolCallContent::Diff(diff) => {
-            let new_lines = diff.new_text.lines().count();
-            let old_lines = diff.old_text.as_deref().map_or(0, |t| t.lines().count());
-            new_lines.max(old_lines) >= WRITE_DIFF_JUMP_THRESHOLD_LINES
-        }
-        _ => false,
-    })
 }
 
 /// Check if any tool call in the current assistant message is still in-progress.

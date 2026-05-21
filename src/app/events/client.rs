@@ -3,7 +3,7 @@ use crate::agent::events::ClientEvent;
 
 #[allow(clippy::too_many_lines)]
 pub fn handle_client_event(app: &mut App, event: ClientEvent) {
-    app.needs_redraw = true;
+    app.request_active_surface_repaint();
     match event {
         ClientEvent::SessionUpdate(update) => super::handle_session_update_event(app, update),
         ClientEvent::PermissionRequest { request, response_tx } => {
@@ -66,6 +66,18 @@ pub fn handle_client_event(app: &mut App, event: ClientEvent) {
         }
         ClientEvent::SlashCommandError(msg) => {
             session::handle_slash_command_error_event(app, &msg);
+        }
+        ClientEvent::TerminalReleasedToChild { reason } => {
+            app.terminal_lifecycle = crate::app::TerminalLifecycleState::ReleasedToChild(reason);
+            app.surface_dirty.clear_for_child_release();
+        }
+        ClientEvent::TerminalReturnedFromChild { reason: _ } => {
+            app.terminal_lifecycle =
+                crate::app::TerminalLifecycleState::Running(crate::app::SurfaceMode::Chat);
+            app.surface_dirty.terminal_mode = true;
+            app.chat_render.clear_measurements();
+            app.chat_render.invalidate_live_anchor();
+            app.request_chat_visible_rebuild();
         }
         ClientEvent::RuntimeReloadCompleted { session_id } => {
             if app.session_id.as_ref().map(ToString::to_string).as_deref()
@@ -138,7 +150,7 @@ pub fn handle_client_event(app: &mut App, event: ClientEvent) {
             let api_provider = account.api_provider.clone();
             app.account_info = Some(account);
             app.sync_welcome_snapshot();
-            app.needs_redraw = true;
+            app.request_active_surface_repaint();
             tracing::info!(
                 target: crate::logging::targets::APP_AUTH,
                 event_name = "status_snapshot_applied",

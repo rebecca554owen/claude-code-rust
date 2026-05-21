@@ -4,8 +4,7 @@
 use super::super::{App, AppStatus, InvalidationLevel, MessageBlock, ToolCallInfo, ToolCallScope};
 use super::tool_calls::{
     current_session_id, has_in_progress_tool_calls, json_value_size, log_terminal_spawned,
-    parent_tool_use_id_from_meta, sdk_tool_name_from_meta, should_jump_on_large_write,
-    tool_scope_name,
+    parent_tool_use_id_from_meta, sdk_tool_name_from_meta, tool_scope_name,
 };
 use crate::agent::model;
 use crate::app::todos::{parse_todos_if_present, set_todos};
@@ -141,10 +140,7 @@ fn apply_tool_call_update_to_indexed_block(
 
         if changed {
             out.changed = true;
-            if should_jump_on_large_write(tc) {
-                app.viewport.engage_auto_scroll();
-            }
-            tc.mark_tool_call_layout_dirty();
+            tc.invalidate_render_cache();
             app.sync_render_cache_slot(mi, bi);
             out.layout_dirty_idx = Some(mi);
         } else {
@@ -710,12 +706,6 @@ mod tests {
             terminal_output_len: 0,
             terminal_bytes_seen: 0,
             terminal_snapshot_mode: TerminalSnapshotMode::AppendOnly,
-            render_epoch: 0,
-            layout_epoch: 0,
-            last_measured_width: 0,
-            last_measured_height: 0,
-            last_measured_layout_epoch: 0,
-            last_measured_layout_generation: 0,
             cache: BlockCache::default(),
             pending_permission: None,
             pending_question: None,
@@ -744,12 +734,6 @@ mod tests {
             terminal_output_len: 0,
             terminal_bytes_seen: 0,
             terminal_snapshot_mode: TerminalSnapshotMode::AppendOnly,
-            render_epoch: 0,
-            layout_epoch: 0,
-            last_measured_width: 0,
-            last_measured_height: 0,
-            last_measured_layout_epoch: 0,
-            last_measured_layout_generation: 0,
             cache: BlockCache::default(),
             pending_permission: None,
             pending_question: None,
@@ -991,5 +975,38 @@ mod tests {
         };
         assert_eq!(tc.status, model::ToolCallStatus::Killed);
         assert!(!app.active_task_ids.contains(tool_id));
+    }
+
+    #[test]
+    fn completed_tool_update_mutates_canonical_tool_block() {
+        let mut app = App::test_default();
+        let tool_id = "tool-1";
+        app.messages.push(ChatMessage::new(
+            MessageRole::Assistant,
+            vec![MessageBlock::ToolCall(Box::new(make_bash_tool_call(
+                tool_id,
+                model::ToolCallStatus::InProgress,
+                Some("term-1"),
+            )))],
+            None,
+        ));
+        app.bind_active_turn_assistant(0);
+        app.index_tool_call(tool_id.to_owned(), 0, 0);
+
+        let update = model::ToolCallUpdate::new(
+            tool_id,
+            model::ToolCallUpdateFields::new()
+                .status(model::ToolCallStatus::Completed)
+                .raw_output(serde_json::Value::String("done".to_owned())),
+        );
+
+        handle_tool_call_update_session(&mut app, &update);
+
+        assert_eq!(app.active_turn_assistant_idx(), Some(0));
+        let MessageBlock::ToolCall(tc) = &app.messages[0].blocks[0] else {
+            panic!("expected tool call block");
+        };
+        assert_eq!(tc.status, model::ToolCallStatus::Completed);
+        assert!(tc.terminal_output.as_deref().is_some_and(|output| output.contains("done")));
     }
 }

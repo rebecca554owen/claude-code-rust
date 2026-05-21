@@ -30,15 +30,14 @@ pub fn render_diff(diff: &model::Diff, width: u16) -> Vec<Line<'static>> {
     // instead of the full file content.
     let udiff = text_diff.unified_diff();
     for hunk in udiff.iter_hunks() {
-        // Extract the @@ header from the hunk's Display output (first line).
-        let hunk_str = hunk.to_string();
-        if let Some(header) = hunk_str.lines().next()
-            && header.starts_with("@@")
-        {
-            lines.push(Line::from(Span::styled(
-                format_compact_hunk_header(header),
-                Style::default().fg(Color::Cyan),
-            )));
+        let (added, removed) =
+            hunk.iter_changes().fold((0, 0), |(added, removed), change| match change.tag() {
+                similar::ChangeTag::Delete => (added, removed + 1),
+                similar::ChangeTag::Insert => (added + 1, removed),
+                similar::ChangeTag::Equal => (added, removed),
+            });
+        if let Some(header) = render_diff_count_header(added, removed) {
+            lines.push(header);
         }
 
         for change in hunk.iter_changes() {
@@ -141,49 +140,27 @@ fn render_raw_diff_line(line: &str) -> Line<'static> {
     Line::from(Span::styled(line.to_owned(), style))
 }
 
-#[derive(Clone, Copy)]
-struct HunkRange {
-    start: usize,
-    count: usize,
-}
-
-fn format_compact_hunk_header(header: &str) -> String {
-    parse_unified_hunk_header(header).map_or_else(
-        || header.to_owned(),
-        |(old_range, new_range)| {
-            let mut parts = Vec::with_capacity(2);
-            if old_range.count > 0 {
-                parts.push(format_range("-", old_range));
-            }
-            if new_range.count > 0 {
-                parts.push(format_range("+", new_range));
-            }
-            if parts.is_empty() { "lines".to_owned() } else { format!("lines {}", parts.join(" ")) }
-        },
-    )
-}
-
-fn parse_unified_hunk_header(header: &str) -> Option<(HunkRange, HunkRange)> {
-    let body = header.strip_prefix("@@ ")?.split(" @@").next()?;
-    let mut parts = body.split_whitespace();
-    let old_range = parse_prefixed_hunk_range(parts.next()?, '-')?;
-    let new_range = parse_prefixed_hunk_range(parts.next()?, '+')?;
-    Some((old_range, new_range))
-}
-
-fn parse_prefixed_hunk_range(token: &str, prefix: char) -> Option<HunkRange> {
-    let raw = token.strip_prefix(prefix)?;
-    let (start, count) = raw.split_once(',').map_or((raw, "1"), |(start, count)| (start, count));
-    Some(HunkRange { start: start.parse().ok()?, count: count.parse().ok()? })
-}
-
-fn format_range(prefix: &str, range: HunkRange) -> String {
-    if range.count <= 1 {
-        format!("{prefix}{}", range.start)
-    } else {
-        let end = range.start.saturating_add(range.count.saturating_sub(1));
-        format!("{prefix}{}-{end}", range.start)
+fn render_diff_count_header(added: usize, removed: usize) -> Option<Line<'static>> {
+    if added == 0 && removed == 0 {
+        return None;
     }
+
+    let punctuation_style = Style::default().fg(theme::DIM);
+    let added_style = Style::default().fg(Color::Green);
+    let removed_style = Style::default().fg(Color::Red);
+    let mut spans = vec![Span::styled("(".to_owned(), punctuation_style)];
+    if added > 0 {
+        spans.push(Span::styled(format!("+{added}"), added_style));
+    }
+    if added > 0 && removed > 0 {
+        spans.push(Span::styled(", ".to_owned(), punctuation_style));
+    }
+    if removed > 0 {
+        spans.push(Span::styled(format!("-{removed}"), removed_style));
+    }
+    spans.push(Span::styled(")".to_owned(), punctuation_style));
+
+    Some(Line::from(spans))
 }
 
 fn render_wrapped_diff_row(
@@ -378,7 +355,8 @@ mod tests {
             .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect())
             .collect();
 
-        assert!(rendered.iter().any(|line| line.contains("lines +1")));
+        assert_eq!(rendered[0], "(+1)");
+        assert_eq!(lines[0].spans[1].style.fg, Some(Color::Green));
         assert!(rendered.iter().any(|line| line.contains("1  +  This is a long")));
         assert!(rendered.iter().any(|line| line.starts_with("      ")));
         assert!(!rendered.iter().any(|line| line == "tmp.md"));
@@ -423,10 +401,24 @@ mod tests {
     }
 
     #[test]
-    fn compact_hunk_header_omits_empty_side_and_uses_ranges() {
-        assert_eq!(format_compact_hunk_header("@@ -0,0 +1,7 @@"), "lines +1-7");
-        assert_eq!(format_compact_hunk_header("@@ -4,3 +4,5 @@"), "lines -4-6 +4-8");
-        assert_eq!(format_compact_hunk_header("@@ -8 +8 @@"), "lines -8 +8");
+    fn diff_count_header_styles_added_and_removed_counts() {
+        let added = render_diff_count_header(4, 0).unwrap();
+        let added_text: String = added.spans.iter().map(|span| span.content.as_ref()).collect();
+        assert_eq!(added_text, "(+4)");
+        assert_eq!(added.spans[1].style.fg, Some(Color::Green));
+
+        let removed = render_diff_count_header(0, 3).unwrap();
+        let removed_text: String = removed.spans.iter().map(|span| span.content.as_ref()).collect();
+        assert_eq!(removed_text, "(-3)");
+        assert_eq!(removed.spans[1].style.fg, Some(Color::Red));
+
+        let mixed = render_diff_count_header(4, 3).unwrap();
+        let mixed_text: String = mixed.spans.iter().map(|span| span.content.as_ref()).collect();
+        assert_eq!(mixed_text, "(+4, -3)");
+        assert_eq!(mixed.spans[1].style.fg, Some(Color::Green));
+        assert_eq!(mixed.spans[3].style.fg, Some(Color::Red));
+
+        assert!(render_diff_count_header(0, 0).is_none());
     }
 
     #[test]

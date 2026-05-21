@@ -2,7 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use ratatui::style::Style;
-use ratatui::text::{Line, Span};
+use ratatui::{
+    buffer::Buffer,
+    layout::Rect,
+    text::{Line, Span, Text},
+    widgets::{Paragraph, Widget, Wrap},
+};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -36,52 +41,6 @@ pub(crate) fn line_display_width(line: &Line<'_>) -> usize {
 }
 
 #[must_use]
-pub(crate) fn truncate_to_width(text: &str, width: usize) -> String {
-    if width == 0 {
-        return String::new();
-    }
-    if display_width(text) <= width {
-        return text.to_owned();
-    }
-
-    let mut out = String::new();
-    let mut used = 0usize;
-    for grapheme in UnicodeSegmentation::graphemes(text, true) {
-        let grapheme_width = display_width(grapheme);
-        if used + grapheme_width > width {
-            break;
-        }
-        out.push_str(grapheme);
-        used += grapheme_width;
-    }
-    out
-}
-
-#[must_use]
-pub(crate) fn take_prefix_by_width(text: &str, width: usize) -> (String, String) {
-    if width == 0 || text.is_empty() {
-        return (String::new(), text.to_owned());
-    }
-
-    let mut used = 0usize;
-    let mut split_at = 0usize;
-    for (idx, grapheme) in UnicodeSegmentation::grapheme_indices(text, true) {
-        let grapheme_width = display_width(grapheme);
-        if used + grapheme_width > width {
-            break;
-        }
-        used += grapheme_width;
-        split_at = idx + grapheme.len();
-    }
-
-    if split_at == 0 {
-        return (String::new(), text.to_owned());
-    }
-
-    (text[..split_at].to_owned(), text[split_at..].to_owned())
-}
-
-#[must_use]
 pub(crate) fn wrap_plain(text: &str, width: usize) -> Vec<String> {
     wrap_styled_chunks(&[StyledChunk { text: text.to_owned(), style: Style::default() }], width)
         .into_iter()
@@ -92,6 +51,27 @@ pub(crate) fn wrap_plain(text: &str, width: usize) -> Vec<String> {
 #[must_use]
 pub(crate) fn wrapped_line_count(text: &str, width: usize) -> usize {
     wrap_plain(text, width).len().max(1)
+}
+
+#[must_use]
+pub(crate) fn wrap_lines_to_physical_rows(
+    lines: &[Line<'static>],
+    width: u16,
+) -> Vec<Line<'static>> {
+    if lines.is_empty() {
+        return Vec::new();
+    }
+    if width == 0 {
+        return vec![Line::default(); lines.len()];
+    }
+
+    let text = Text::from(lines.to_vec());
+    let height = Paragraph::new(text.clone()).wrap(Wrap { trim: false }).line_count(width).max(1);
+    let area = Rect::new(0, 0, width, u16::try_from(height).unwrap_or(u16::MAX));
+    let mut buffer = Buffer::empty(area);
+    Paragraph::new(text).wrap(Wrap { trim: false }).render(area, &mut buffer);
+
+    (0..area.height).map(|row| buffer_row_to_line(&buffer, area, row)).collect()
 }
 
 #[must_use]
@@ -277,19 +257,46 @@ fn push_styled_text(spans: &mut Vec<Span<'static>>, text: &str, style: Style) {
     spans.push(Span::styled(text.to_owned(), style));
 }
 
+fn buffer_row_to_line(buf: &Buffer, area: Rect, row: u16) -> Line<'static> {
+    let y = area.y.saturating_add(row);
+    let mut spans = Vec::new();
+    let mut current_style = None;
+    let mut current_text = String::new();
+
+    for x in 0..area.width {
+        let Some(cell) = buf.cell((area.x.saturating_add(x), y)) else {
+            continue;
+        };
+        let symbol = cell.symbol();
+        if symbol.is_empty() {
+            continue;
+        }
+        let style = cell.style();
+        match current_style {
+            Some(existing) if existing == style => current_text.push_str(symbol),
+            Some(existing) => {
+                spans.push(Span::styled(std::mem::take(&mut current_text), existing));
+                current_text.push_str(symbol);
+                current_style = Some(style);
+            }
+            None => {
+                current_text.push_str(symbol);
+                current_style = Some(style);
+            }
+        }
+    }
+
+    if let Some(style) = current_style {
+        spans.push(Span::styled(current_text, style));
+    }
+    Line::from(spans)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use ratatui::style::Modifier;
-
-    #[test]
-    fn take_prefix_by_width_handles_grapheme_clusters() {
-        let text = "a👩‍💻b";
-        let (chunk, rest) = take_prefix_by_width(text, 3);
-        assert_eq!(chunk, "a👩‍💻");
-        assert_eq!(rest, "b");
-    }
 
     #[test]
     fn wrap_plain_preserves_explicit_newlines() {

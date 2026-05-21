@@ -3,6 +3,7 @@
 
 use crate::agent::model;
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModeInfo {
     pub id: String,
@@ -14,14 +15,6 @@ pub struct ModeState {
     pub current_mode_id: String,
     pub current_mode_name: String,
     pub available_modes: Vec<ModeInfo>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum HelpView {
-    #[default]
-    Keys,
-    SlashCommands,
-    Subagents,
 }
 
 /// Login hint displayed when authentication is required during connection.
@@ -155,6 +148,7 @@ pub struct SessionUsageState {
     pub context_usage_percent: Option<u8>,
     pub context_usage_in_flight: bool,
     pub context_usage_refresh_pending: bool,
+    pub context_usage_last_requested_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -243,33 +237,9 @@ pub enum CancelOrigin {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SelectionKind {
-    Chat,
-    Input,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SelectionPoint {
     pub row: usize,
     pub col: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SelectionState {
-    pub kind: SelectionKind,
-    pub start: SelectionPoint,
-    pub end: SelectionPoint,
-    pub dragging: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ScrollbarDragState {
-    /// Row offset from thumb top where the initial click happened.
-    pub thumb_grab_offset: usize,
-    /// Visible track length used when the drag started.
-    pub track_space: usize,
-    /// Maximum scrollable row offset when the drag started.
-    pub max_scroll: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

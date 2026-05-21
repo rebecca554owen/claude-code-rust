@@ -3,36 +3,35 @@
 
 pub mod block_cache;
 pub mod cache_metrics;
+pub mod chat_render;
 mod history_retention;
 pub mod messages;
 mod render_budget;
 pub mod tool_call_info;
 pub mod types;
-pub mod viewport;
 
 // Re-export all public types so external `use crate::app::state::X` paths still work.
 pub use block_cache::BlockCache;
 pub use cache_metrics::CacheMetrics;
+pub use chat_render::{
+    ChatRenderState, ComposerRenderState, LiveRegionRenderState, TerminalSize, TerminalSizeChange,
+};
 pub(crate) use messages::MarkdownRenderKey;
 pub use messages::{
-    CachedMessageSegment, ChatMessage, IncrementalMarkdown, MessageBlock,
-    MessageBlockRenderSignature, MessageRenderCache, MessageRenderCacheKey, MessageRenderSignature,
-    MessageRole, NoticeBlock, NoticeDedupKey, RateLimitIncidentKey, SystemSeverity, TextBlock,
-    TextBlockSpacing, WelcomeBlock, hash_text_block_content, hash_welcome_block_content,
+    ChatMessage, ChatMessageId, HistoryOutputId, ImageAttachmentBlock, IncrementalMarkdown,
+    MessageBlock, MessageBlockId, MessageRole, NoticeBlock, NoticeDedupKey, RateLimitIncidentKey,
+    SystemSeverity, TextBlock, TextBlockSpacing, WelcomeBlock, hash_text_block_content,
+    hash_welcome_block_content,
 };
 pub use tool_call_info::{
     InlinePermission, InlineQuestion, TerminalSnapshotMode, ToolCallInfo, is_execute_tool_name,
 };
 pub use types::{
-    AppStatus, CancelOrigin, ExtraUsage, HelpView, HistoryRetentionPolicy, HistoryRetentionStats,
-    LoginHint, McpState, MessageUsage, ModeInfo, ModeState, PasteSessionState, PendingCommandAck,
-    RecentSessionInfo, RenderCacheBudget, ScrollbarDragState, SelectionKind, SelectionPoint,
-    SelectionState, SessionPickerState, SessionUsageState, TodoItem, TodoStatus, ToolCallScope,
-    UpdateNoticeState, UsageSnapshot, UsageSourceKind, UsageSourceMode, UsageState, UsageWindow,
-};
-pub use viewport::{
-    ChatViewport, LayoutInvalidation, LayoutInvalidation as InvalidationLevel,
-    LayoutRemeasureReason, ScrollbarGeometry, compute_scrollbar_geometry,
+    AppStatus, CancelOrigin, ExtraUsage, HistoryRetentionPolicy, HistoryRetentionStats, LoginHint,
+    McpState, MessageUsage, ModeInfo, ModeState, PasteSessionState, PendingCommandAck,
+    RecentSessionInfo, RenderCacheBudget, SelectionPoint, SessionPickerState, SessionUsageState,
+    TodoItem, TodoStatus, ToolCallScope, UpdateNoticeState, UsageSnapshot, UsageSourceKind,
+    UsageSourceMode, UsageState, UsageWindow,
 };
 
 use crate::agent::events::ClientEvent;
@@ -45,7 +44,6 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 
 use super::config::ConfigState;
-use super::dialog;
 use super::file_index;
 use super::focus::{FocusContext, FocusManager, FocusOwner, FocusTarget};
 use super::git_context::GitContextState;
@@ -56,7 +54,8 @@ use super::plugins::PluginsState;
 use super::slash;
 use super::subagent;
 use super::trust::TrustState;
-use super::view::ActiveView;
+use super::view::SurfaceMode;
+use super::{SurfaceDirtyState, TerminalLifecycleState};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TerminalToolCallRef {
@@ -117,12 +116,22 @@ pub struct ChatRenderTraceState {
     pub rendered_line_count: usize,
     pub last_message_idx: Option<usize>,
     pub last_message_height: Option<usize>,
-    pub selection_snapshot_active: bool,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutInvalidation {
+    MessageChanged(usize),
+    MessagesFrom(usize),
+    Global,
+}
+
+pub use LayoutInvalidation as InvalidationLevel;
 
 #[allow(clippy::struct_excessive_bools)]
 pub struct App {
-    pub active_view: ActiveView,
+    pub surface_mode: SurfaceMode,
+    pub terminal_lifecycle: TerminalLifecycleState,
+    pub surface_dirty: SurfaceDirtyState,
     pub config: ConfigState,
     pub trust: TrustState,
     pub settings_home_override: Option<PathBuf>,
@@ -131,12 +140,12 @@ pub struct App {
     pub message_retained_bytes: Vec<usize>,
     /// Rolling total of `message_retained_bytes`.
     pub retained_history_bytes: usize,
-    /// Single owner of all chat layout state: scroll, per-message heights, prefix sums.
-    pub viewport: ChatViewport,
     pub input: InputState,
     pub status: AppStatus,
     /// Session id currently being resumed via `/resume`.
     pub resuming_session_id: Option<String>,
+    /// Whether the synthetic session overview is eligible for chat transcript output.
+    pub show_session_overview: bool,
     /// Spinner label shown while a slash command is in flight (`CommandPending`).
     pub pending_command_label: Option<String>,
     /// Ack marker required to clear `CommandPending` for strict completion semantics.
@@ -161,15 +170,6 @@ pub struct App {
     /// When true, the current/next turn completion should clear local conversation history.
     /// Set by `/compact` once the command is accepted for bridge forwarding.
     pub pending_compact_clear: bool,
-    /// Active help overlay view when `?` help is open.
-    pub help_view: HelpView,
-    /// Whether the help overlay is explicitly open.
-    pub help_open: bool,
-    /// Scroll/selection state for the Slash and Subagents help tabs.
-    pub help_dialog: dialog::DialogState,
-    /// Number of items that currently fit in the help viewport (updated each render).
-    /// Used by key handlers for accurate scroll step size.
-    pub help_visible_count: usize,
     /// Tool call IDs with pending inline interactions, ordered by arrival.
     /// The first entry is the focused interaction that receives keyboard input.
     /// Up / Down arrow keys cycle focus through the list.
@@ -190,9 +190,6 @@ pub struct App {
     pub spinner_last_advance_at: Option<Instant>,
     /// Message index that owns the current main-assistant turn indicators.
     pub active_turn_assistant_message_idx: Option<usize>,
-    /// Session-level preference for collapsing non-Execute tool call bodies.
-    /// Toggled by Ctrl+O and applied at render/layout time.
-    pub tools_collapsed: bool,
     /// IDs of root Task/Agent tool calls currently `InProgress`.
     /// Use `insert_active_task()`, `remove_active_task()`.
     pub active_task_ids: HashSet<String>,
@@ -201,20 +198,11 @@ pub struct App {
     pub tool_call_scopes: HashMap<String, ToolCallScope>,
     /// Shared terminal process map - used to snapshot output on completion.
     pub terminals: crate::agent::events::TerminalMap,
-    /// Force a full terminal clear on next render frame.
-    pub force_redraw: bool,
     /// O(1) lookup: `tool_call_id` -> `(message_index, block_index)`.
     /// Use `lookup_tool_call()`, `index_tool_call()`.
     pub tool_call_index: HashMap<String, (usize, usize)>,
     /// Current todo list from Claude's `TodoWrite` tool calls.
     pub todos: Vec<TodoItem>,
-    /// Whether the todo panel is expanded (true) or shows compact status line (false).
-    /// Toggled by Ctrl+T.
-    pub show_todo_panel: bool,
-    /// Scroll offset for the expanded todo panel (capped at 5 visible lines).
-    pub todo_scroll: usize,
-    /// Selected todo index used for keyboard navigation in the open todo panel.
-    pub todo_selected: usize,
     /// Focus manager for directional/navigation key ownership.
     pub focus: FocusManager,
     /// Commands advertised by the agent via `AvailableCommandsUpdate`.
@@ -229,20 +217,8 @@ pub struct App {
     pub recent_sessions: Vec<RecentSessionInfo>,
     /// Selection state for the startup session picker screen.
     pub session_picker: SessionPickerState,
-    /// Last known frame area (for mouse selection mapping).
-    pub cached_frame_area: ratatui::layout::Rect,
-    /// Current selection state for mouse-based selection.
-    pub selection: Option<SelectionState>,
-    /// Active scrollbar drag state while left mouse button is held on the rail.
-    pub scrollbar_drag: Option<ScrollbarDragState>,
-    /// Cached rendered chat lines for selection/copy.
-    pub rendered_chat_lines: Vec<String>,
-    /// Area where chat content was rendered (for selection mapping).
-    pub rendered_chat_area: ratatui::layout::Rect,
-    /// Cached rendered input lines for selection/copy.
-    pub rendered_input_lines: Vec<String>,
-    /// Area where input content was rendered (for selection mapping).
-    pub rendered_input_area: ratatui::layout::Rect,
+    /// Deterministic measurement state for the future mutable chat region.
+    pub chat_render: ChatRenderState,
     /// Active `@` file mention autocomplete state.
     pub mention: Option<mention::MentionState>,
     /// App-owned file index backing `@` file mention autocomplete.
@@ -275,8 +251,6 @@ pub struct App {
     /// consumed on submit. No cap on count — this is a developer tool, so
     /// users are trusted to attach as many images as they need.
     pub pending_images: Vec<crate::app::clipboard_image::ImageAttachment>,
-    /// Cached todo compact line (invalidated on `set_todos()`).
-    pub cached_todo_compact: Option<ratatui::text::Line<'static>>,
     /// Git repo context used by footer/status rendering and live branch tracking.
     pub(crate) git_context: GitContextState,
     /// Update availability state for the current app lifetime.
@@ -307,8 +281,6 @@ pub struct App {
     pub terminal_tool_calls: Vec<TerminalToolCallRef>,
     /// Membership index for `terminal_tool_calls`, used to avoid linear duplicate checks.
     pub terminal_tool_call_membership: HashSet<TerminalToolCallRef>,
-    /// Dirty flag: skip `terminal.draw()` when nothing changed since last frame.
-    pub needs_redraw: bool,
     /// Central notification manager (bell + desktop toast when unfocused).
     pub notifications: super::notify::NotificationManager,
     /// Performance logger. Present only when built with `--features perf`.
@@ -340,8 +312,6 @@ pub struct App {
     pub last_frame_at: Option<Instant>,
     /// Last emitted chat render trace snapshot to suppress identical per-frame summaries.
     pub last_chat_render_trace_state: Option<ChatRenderTraceState>,
-    /// Height-affecting active assistant indicator state from the previous frame.
-    pub(crate) last_active_turn_height_state: Option<(usize, bool, bool)>,
     pub startup_connection_requested: bool,
     pub connection_started: bool,
     pub startup_bridge_script: Option<PathBuf>,
@@ -407,6 +377,49 @@ impl App {
             pending_chars = self.pending_paste_text.chars().count(),
             had_pending_submit,
         );
+    }
+
+    pub(crate) fn request_chat_repaint(&mut self) {
+        self.surface_dirty.chat.request_repaint();
+    }
+
+    pub(crate) fn request_chat_mutable_rebuild(&mut self) {
+        self.surface_dirty.chat.request_mutable_rebuild();
+    }
+
+    pub(crate) fn request_chat_visible_rebuild(&mut self) {
+        self.surface_dirty.chat.request_visible_screen_rebuild();
+    }
+
+    pub(crate) fn request_chat_fullscreen_return_rebuild(&mut self) {
+        self.surface_dirty.chat.request_fullscreen_return_rebuild();
+    }
+
+    pub(crate) fn request_chat_resize_purge_replay_rebuild(&mut self) {
+        self.surface_dirty.chat.request_resize_purge_replay_rebuild();
+    }
+
+    pub(crate) fn request_chat_session_boundary_rebuild(&mut self) {
+        self.surface_dirty.chat.request_session_boundary_rebuild();
+    }
+
+    pub(crate) fn request_fullscreen_repaint(&mut self) {
+        self.surface_dirty.fullscreen.redraw = true;
+    }
+
+    pub(crate) fn request_active_surface_repaint(&mut self) {
+        match self.terminal_lifecycle {
+            TerminalLifecycleState::Running(SurfaceMode::Fullscreen(_)) => {
+                self.request_fullscreen_repaint();
+            }
+            TerminalLifecycleState::Running(SurfaceMode::Chat)
+            | TerminalLifecycleState::Bootstrapping => {
+                self.request_chat_repaint();
+            }
+            TerminalLifecycleState::ReleasedToChild(_)
+            | TerminalLifecycleState::Restoring
+            | TerminalLifecycleState::Exited => {}
+        }
     }
 
     /// Mark one presented frame at `now`, updating smoothed FPS.
@@ -503,26 +516,34 @@ impl App {
         let subscription = self.welcome_subscription_display().to_owned();
         let cwd = self.welcome_cwd_display().to_owned();
         let session_id = self.welcome_session_id_display();
-        let Some(first) = self.messages.first_mut() else {
+        let Some(first) = self.messages.first() else {
             return;
         };
         if !matches!(first.role, MessageRole::Welcome) {
             return;
         }
-        let Some(MessageBlock::Welcome(welcome)) = first.blocks.first_mut() else {
-            return;
-        };
-        if welcome.version != version
-            || welcome.subscription != subscription
-            || welcome.cwd != cwd
-            || welcome.session_id != session_id
+        let mut changed = false;
         {
-            version.clone_into(&mut welcome.version);
-            welcome.subscription = subscription;
-            welcome.cwd = cwd;
-            welcome.session_id = session_id;
-            welcome.cache.invalidate();
-            self.sync_render_cache_slot(0, 0);
+            let Some(first) = self.messages.first_mut() else {
+                return;
+            };
+            let Some(MessageBlock::Welcome(welcome)) = first.blocks.first_mut() else {
+                return;
+            };
+            if welcome.version != version
+                || welcome.subscription != subscription
+                || welcome.cwd != cwd
+                || welcome.session_id != session_id
+            {
+                version.clone_into(&mut welcome.version);
+                welcome.subscription = subscription;
+                welcome.cwd = cwd;
+                welcome.session_id = session_id;
+                welcome.cache.invalidate();
+                changed = true;
+            }
+        }
+        if changed {
             self.recompute_message_retained_bytes(0);
             self.invalidate_layout(InvalidationLevel::MessagesFrom(0));
         }
@@ -613,39 +634,15 @@ impl App {
 
     pub(crate) fn sync_after_message_blocks_changed(&mut self, msg_idx: usize) {
         self.note_render_cache_structure_changed();
-        if let Some(message) = self.messages.get_mut(msg_idx) {
-            message.invalidate_render_cache();
-        }
         self.sync_render_cache_message(msg_idx);
         self.recompute_message_retained_bytes(msg_idx);
         self.invalidate_layout(InvalidationLevel::MessageChanged(msg_idx));
     }
 
-    /// Invalidate message layout caches at the given level.
-    ///
-    /// Single entry point for all layout invalidation. Replaces the former
-    /// `mark_message_layout_dirty` / `mark_all_message_layout_dirty` methods.
-    pub fn invalidate_layout(&mut self, level: LayoutInvalidation) {
-        match level {
-            LayoutInvalidation::MessageChanged(idx) => {
-                self.viewport.invalidate_message(idx);
-            }
-            LayoutInvalidation::MessagesFrom(idx) => {
-                self.viewport.invalidate_messages_from(idx);
-            }
-            LayoutInvalidation::Global => {
-                if self.messages.is_empty() {
-                    return;
-                }
-                self.viewport.invalidate_all_messages(LayoutRemeasureReason::Global);
-                self.viewport.bump_layout_generation();
-            }
-            LayoutInvalidation::Resize => {
-                // Resize is handled by viewport.on_frame(). This arm exists
-                // for exhaustiveness; production code should not reach it.
-                debug_assert!(false, "Resize should not be dispatched through invalidate_layout");
-            }
-        }
+    pub fn invalidate_layout(&mut self, _level: LayoutInvalidation) {
+        self.chat_render.clear_measurements();
+        self.chat_render.invalidate_live_anchor();
+        self.request_chat_repaint();
     }
 
     pub(crate) fn invalidate_message_set<I>(&mut self, indices: I)
@@ -654,8 +651,8 @@ impl App {
     {
         let unique: BTreeSet<_> =
             indices.into_iter().filter(|&idx| idx < self.messages.len()).collect();
-        for idx in unique {
-            self.viewport.invalidate_message(idx);
+        if !unique.is_empty() {
+            self.invalidate_layout(LayoutInvalidation::Global);
         }
     }
 
@@ -670,15 +667,10 @@ impl App {
             self.cache_metrics.record_history_enforcement(&stats, self.history_retention);
         if should_log {
             let snap = cache_metrics::build_snapshot(
-                &self.render_cache_budget,
                 &self.history_retention_stats,
                 self.history_retention,
                 &self.cache_metrics,
-                &self.viewport,
-                0, // entry_count not needed for history-only log
-                0,
                 stats.dropped_messages,
-                0, // protected_bytes not relevant for history-only log
             );
             cache_metrics::emit_history_metrics(&snap);
         }
@@ -702,7 +694,7 @@ impl App {
                         model::ToolCallStatus::InProgress | model::ToolCallStatus::Pending
                     ) {
                         tc.status = new_status;
-                        tc.mark_tool_call_layout_dirty();
+                        tc.invalidate_render_cache();
                         changed_slots.push((msg_idx, block_idx));
                         if tc.pending_permission.take().is_some() {
                             cleared_interaction = true;
@@ -766,7 +758,7 @@ impl App {
                 if !block_changed {
                     continue;
                 }
-                tc.mark_tool_call_layout_dirty();
+                tc.invalidate_render_cache();
                 changed_slots.push((msg_idx, block_idx));
                 if changed_message_indices.last().copied() != Some(msg_idx) {
                     changed_message_indices.push(msg_idx);
@@ -811,17 +803,19 @@ impl App {
         let (tx, rx) = mpsc::unbounded_channel();
         let (file_index_tx, file_index_rx) = std_mpsc::channel();
         Self {
-            active_view: ActiveView::Chat,
+            surface_mode: SurfaceMode::Chat,
+            terminal_lifecycle: TerminalLifecycleState::Running(SurfaceMode::Chat),
+            surface_dirty: SurfaceDirtyState::initial_chat(),
             config: ConfigState::default(),
             trust: TrustState::default(),
             settings_home_override: None,
             messages: Vec::new(),
             message_retained_bytes: Vec::new(),
             retained_history_bytes: 0,
-            viewport: ChatViewport::new(),
             input: InputState::new(),
             status: AppStatus::Ready,
             resuming_session_id: None,
+            show_session_overview: true,
             pending_command_label: None,
             pending_command_ack: None,
             should_quit: false,
@@ -840,10 +834,6 @@ impl App {
             config_options: BTreeMap::new(),
             login_hint: None,
             pending_compact_clear: false,
-            help_view: HelpView::Keys,
-            help_open: false,
-            help_dialog: dialog::DialogState::default(),
-            help_visible_count: 0,
             pending_interaction_ids: Vec::new(),
             cancelled_turn_pending_hint: false,
             pending_cancel_origin: None,
@@ -855,16 +845,11 @@ impl App {
             spinner_frame: 0,
             spinner_last_advance_at: None,
             active_turn_assistant_message_idx: None,
-            tools_collapsed: false,
             active_task_ids: HashSet::default(),
             tool_call_scopes: HashMap::default(),
             terminals: std::rc::Rc::default(),
-            force_redraw: false,
             tool_call_index: HashMap::default(),
             todos: Vec::new(),
-            show_todo_panel: false,
-            todo_scroll: 0,
-            todo_selected: 0,
             focus: FocusManager::default(),
             available_commands: Vec::new(),
             plugins: PluginsState::default(),
@@ -872,13 +857,7 @@ impl App {
             available_models: Vec::new(),
             recent_sessions: Vec::new(),
             session_picker: SessionPickerState::default(),
-            cached_frame_area: ratatui::layout::Rect::default(),
-            selection: None,
-            scrollbar_drag: None,
-            rendered_chat_lines: Vec::new(),
-            rendered_chat_area: ratatui::layout::Rect::default(),
-            rendered_input_lines: Vec::new(),
-            rendered_input_area: ratatui::layout::Rect::default(),
+            chat_render: ChatRenderState::default(),
             mention: None,
             file_index: file_index::FileIndexState::default(),
             slash: None,
@@ -890,7 +869,6 @@ impl App {
             active_paste_session: None,
             next_paste_session_id: 1,
             pending_images: Vec::new(),
-            cached_todo_compact: None,
             git_context: GitContextState::default(),
             update_notice: None,
             session_usage: SessionUsageState::default(),
@@ -905,7 +883,6 @@ impl App {
             account_info: None,
             terminal_tool_calls: Vec::new(),
             terminal_tool_call_membership: HashSet::new(),
-            needs_redraw: true,
             notifications: super::notify::NotificationManager::new(),
             perf: None,
             render_cache_budget: RenderCacheBudget::default(),
@@ -920,7 +897,6 @@ impl App {
             fps_ema: None,
             last_frame_at: None,
             last_chat_render_trace_state: None,
-            last_active_turn_height_state: None,
             startup_connection_requested: false,
             connection_started: false,
             startup_bridge_script: None,
@@ -938,11 +914,15 @@ impl App {
     }
 
     pub fn sync_git_context(&mut self) {
-        self.needs_redraw |= self.git_context.sync_to_cwd(Path::new(&self.cwd_raw));
+        if self.git_context.sync_to_cwd(Path::new(&self.cwd_raw)) {
+            self.request_chat_repaint();
+        }
     }
 
     pub fn tick_git_context(&mut self, now: Instant) {
-        self.needs_redraw |= self.git_context.tick(Path::new(&self.cwd_raw), now);
+        if self.git_context.tick(Path::new(&self.cwd_raw), now) {
+            self.request_chat_repaint();
+        }
     }
 
     #[cfg(test)]
@@ -1099,18 +1079,6 @@ impl App {
     }
 
     #[must_use]
-    pub fn is_help_active(&self) -> bool {
-        self.help_open
-    }
-
-    pub fn sync_help_open_with_input(&mut self) {
-        if self.help_open && self.input.text().trim() != "?" {
-            self.help_open = false;
-            self.release_focus_target(FocusTarget::Help);
-        }
-    }
-
-    #[must_use]
     pub fn autocomplete_focus_available(&self) -> bool {
         self.mention.as_ref().is_some_and(mention::MentionState::has_selectable_candidates)
             || self.slash.is_some()
@@ -1123,7 +1091,7 @@ impl App {
     }
 
     pub fn rebuild_chat_focus_from_state(&mut self) {
-        if self.active_view != ActiveView::Chat {
+        if self.surface_mode != SurfaceMode::Chat {
             return;
         }
 
@@ -1142,15 +1110,6 @@ impl App {
             self.claim_focus_target(FocusTarget::Mention);
         } else {
             self.release_focus_target(FocusTarget::Mention);
-        }
-
-        if self.is_help_active()
-            && self.pending_interaction_ids.is_empty()
-            && !self.autocomplete_focus_available()
-        {
-            self.claim_focus_target(FocusTarget::Help);
-        } else {
-            self.release_focus_target(FocusTarget::Help);
         }
 
         self.normalize_focus_stack();
@@ -1178,11 +1137,9 @@ impl App {
     #[must_use]
     fn focus_context(&self) -> FocusContext {
         FocusContext::new(
-            self.show_todo_panel && !self.todos.is_empty(),
             self.autocomplete_focus_available(),
             !self.pending_interaction_ids.is_empty(),
         )
-        .with_help(self.is_help_active())
     }
 }
 
@@ -1193,7 +1150,6 @@ mod tests {
     // =====
 
     use super::*;
-    use crate::app::dialog;
     use crate::app::slash::{SlashCandidate, SlashContext, SlashState};
     use pretty_assertions::assert_eq;
     use ratatui::style::{Color, Style};
@@ -1341,9 +1297,10 @@ mod tests {
     }
 
     #[test]
-    fn cache_store_with_height_then_height_at() {
+    fn cache_set_height_then_height_at() {
         let mut cache = BlockCache::default();
-        cache.store_with_height(vec![Line::from("hello")], 1, 80);
+        cache.store(vec![Line::from("hello")]);
+        cache.set_height(1, 80);
         assert_eq!(cache.height_at(80), Some(1));
         assert!(cache.get().is_some());
     }
@@ -1351,14 +1308,16 @@ mod tests {
     #[test]
     fn cache_height_at_wrong_width_returns_none() {
         let mut cache = BlockCache::default();
-        cache.store_with_height(vec![Line::from("hello")], 1, 80);
+        cache.store(vec![Line::from("hello")]);
+        cache.set_height(1, 80);
         assert!(cache.height_at(120).is_none());
     }
 
     #[test]
     fn cache_height_invalidated_returns_none() {
         let mut cache = BlockCache::default();
-        cache.store_with_height(vec![Line::from("hello")], 1, 80);
+        cache.store(vec![Line::from("hello")]);
+        cache.set_height(1, 80);
         cache.invalidate();
         assert!(cache.height_at(80).is_none());
     }
@@ -1379,6 +1338,7 @@ mod tests {
         app.session_usage.context_usage_percent = Some(62);
         app.session_usage.context_usage_in_flight = true;
         app.session_usage.context_usage_refresh_pending = true;
+        app.session_usage.context_usage_last_requested_at = Some(Instant::now());
         app.session_usage.last_compaction_pre_tokens = Some(123_456);
 
         app.clear_session_runtime_identity();
@@ -1390,6 +1350,13 @@ mod tests {
     }
 
     #[test]
+    fn test_default_initializes_chat_render_state() {
+        let app = App::test_default();
+
+        assert_eq!(app.chat_render, ChatRenderState::default());
+    }
+
+    #[test]
     fn cache_store_without_height_has_no_height() {
         let mut cache = BlockCache::default();
         cache.store(vec![Line::from("hello")]);
@@ -1398,11 +1365,13 @@ mod tests {
     }
 
     #[test]
-    fn cache_store_with_height_overwrite() {
+    fn cache_store_and_set_height_overwrite() {
         let mut cache = BlockCache::default();
-        cache.store_with_height(vec![Line::from("old")], 1, 80);
+        cache.store(vec![Line::from("old")]);
+        cache.set_height(1, 80);
         cache.invalidate();
-        cache.store_with_height(vec![Line::from("new long line")], 3, 120);
+        cache.store(vec![Line::from("new long line")]);
+        cache.set_height(3, 120);
         assert_eq!(cache.height_at(120), Some(3));
         assert!(cache.height_at(80).is_none());
     }
@@ -1451,36 +1420,6 @@ mod tests {
     }
 
     #[test]
-    fn cache_store_then_set_height_matches_store_with_height() {
-        let mut cache_a = BlockCache::default();
-        cache_a.store(vec![Line::from("test")]);
-        cache_a.set_height(2, 100);
-
-        let mut cache_b = BlockCache::default();
-        cache_b.store_with_height(vec![Line::from("test")], 2, 100);
-
-        assert_eq!(cache_a.height_at(100), cache_b.height_at(100));
-        assert_eq!(cache_a.get().unwrap().len(), cache_b.get().unwrap().len());
-    }
-
-    #[test]
-    fn cache_measure_and_set_height_from_segments() {
-        let mut cache = BlockCache::default();
-        let lines = vec![
-            Line::from("alpha beta gamma delta epsilon"),
-            Line::from("zeta eta theta iota kappa lambda"),
-            Line::from("mu nu xi omicron pi rho sigma"),
-        ];
-        cache.store(lines.clone());
-        let measured = cache.measure_and_set_height(16).expect("expected measured height");
-        let expected = ratatui::widgets::Paragraph::new(ratatui::text::Text::from(lines))
-            .wrap(ratatui::widgets::Wrap { trim: false })
-            .line_count(16);
-        assert_eq!(measured, expected);
-        assert_eq!(cache.height_at(16), Some(expected));
-    }
-
-    #[test]
     fn cache_get_updates_last_access_tick() {
         let mut cache = BlockCache::default();
         cache.store(vec![Line::from("tick")]);
@@ -1504,6 +1443,114 @@ mod tests {
         ChatMessage::new(MessageRole::User, vec![assistant_text_block(text)], None)
     }
 
+    fn system_text_message(text: &str) -> ChatMessage {
+        ChatMessage::new(
+            MessageRole::System(Some(SystemSeverity::Info)),
+            vec![assistant_text_block(text)],
+            None,
+        )
+    }
+
+    fn user_text_image_message(text: &str, image_count: usize) -> ChatMessage {
+        ChatMessage::new(
+            MessageRole::User,
+            vec![
+                assistant_text_block(text),
+                MessageBlock::ImageAttachment(ImageAttachmentBlock::new(image_count)),
+            ],
+            None,
+        )
+    }
+
+    fn set_account_subscription(app: &mut App, subscription: &str) {
+        app.account_info = Some(crate::agent::types::AccountInfo {
+            subscription_type: Some(subscription.to_owned()),
+            ..Default::default()
+        });
+    }
+
+    #[test]
+    fn push_message_tracked_appends_user_message_and_requests_repaint() {
+        let mut app = make_test_app();
+        let _ = app.surface_dirty.chat.take_repaint();
+
+        app.push_message_tracked(user_text_message("hello"));
+
+        assert_eq!(app.messages.len(), 1);
+        assert!(matches!(app.messages[0].role, MessageRole::User));
+        let MessageBlock::Text(text) = &app.messages[0].blocks[0] else {
+            panic!("expected text block");
+        };
+        assert_eq!(text.text, "hello");
+        assert!(app.surface_dirty.chat.repaint);
+    }
+
+    #[test]
+    fn push_message_tracked_preserves_message_order() {
+        let mut app = make_test_app();
+
+        app.push_message_tracked(user_text_message("first"));
+        app.push_message_tracked(system_text_message("second"));
+
+        assert_eq!(app.messages.len(), 2);
+        assert!(matches!(app.messages[0].role, MessageRole::User));
+        assert!(matches!(app.messages[1].role, MessageRole::System(Some(SystemSeverity::Info))));
+    }
+
+    #[test]
+    fn sync_welcome_snapshot_updates_canonical_welcome_message() {
+        let mut app = make_test_app();
+        app.ensure_welcome_message();
+
+        app.session_id = Some(crate::agent::model::SessionId::new("session-1"));
+        set_account_subscription(&mut app, "Pro");
+
+        app.sync_welcome_snapshot();
+        app.sync_welcome_snapshot();
+
+        let MessageBlock::Welcome(welcome) = &app.messages[0].blocks[0] else {
+            panic!("expected welcome block");
+        };
+        assert_eq!(welcome.subscription, "Pro");
+        assert_eq!(welcome.session_id, "session-1");
+    }
+
+    #[test]
+    fn sync_welcome_snapshot_updates_existing_canonical_welcome_in_place() {
+        let mut app = make_test_app();
+        app.ensure_welcome_message();
+        app.session_id = Some(crate::agent::model::SessionId::new("session-1"));
+        set_account_subscription(&mut app, "Pro");
+        app.sync_welcome_snapshot();
+
+        set_account_subscription(&mut app, "Claude Max");
+        app.sync_welcome_snapshot();
+
+        let MessageBlock::Welcome(welcome) = &app.messages[0].blocks[0] else {
+            panic!("expected welcome block");
+        };
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(welcome.subscription, "Claude Max");
+    }
+
+    #[test]
+    fn push_message_tracked_preserves_user_image_attachment_block() {
+        let mut app = make_test_app();
+
+        app.push_message_tracked(user_text_image_message("see attached", 2));
+
+        assert_eq!(app.messages.len(), 1);
+        assert!(matches!(app.messages[0].role, MessageRole::User));
+        let MessageBlock::Text(text) = &app.messages[0].blocks[0] else {
+            panic!("expected text block");
+        };
+        assert_eq!(text.text, "see attached");
+        let MessageBlock::ImageAttachment(image) = &app.messages[0].blocks[1] else {
+            panic!("expected image attachment block");
+        };
+        assert_eq!(image.count, 2);
+    }
+
     fn assistant_tool_message(id: &str, status: model::ToolCallStatus) -> ChatMessage {
         ChatMessage::new(
             MessageRole::Assistant,
@@ -1524,12 +1571,6 @@ mod tests {
                 terminal_output_len: 1024,
                 terminal_bytes_seen: 1024,
                 terminal_snapshot_mode: TerminalSnapshotMode::AppendOnly,
-                render_epoch: 0,
-                layout_epoch: 0,
-                last_measured_width: 0,
-                last_measured_height: 0,
-                last_measured_layout_epoch: 0,
-                last_measured_layout_generation: 0,
                 cache: BlockCache::default(),
                 pending_permission: None,
                 pending_question: None,
@@ -1562,12 +1603,6 @@ mod tests {
                 terminal_output_len: 1024,
                 terminal_bytes_seen: 1024,
                 terminal_snapshot_mode: TerminalSnapshotMode::AppendOnly,
-                render_epoch: 0,
-                layout_epoch: 0,
-                last_measured_width: 0,
-                last_measured_height: 0,
-                last_measured_layout_epoch: 0,
-                last_measured_layout_generation: 0,
                 cache: BlockCache::default(),
                 pending_permission: None,
                 pending_question: None,
@@ -1597,12 +1632,6 @@ mod tests {
                 terminal_output_len: 1024,
                 terminal_bytes_seen: 1024,
                 terminal_snapshot_mode: TerminalSnapshotMode::AppendOnly,
-                render_epoch: 0,
-                layout_epoch: 0,
-                last_measured_width: 0,
-                last_measured_height: 0,
-                last_measured_layout_epoch: 0,
-                last_measured_layout_generation: 0,
                 cache: BlockCache::default(),
                 pending_permission: Some(InlinePermission {
                     options: vec![model::PermissionOption::new(
@@ -1845,49 +1874,6 @@ mod tests {
     }
 
     #[test]
-    fn enforce_render_cache_budget_accounts_for_message_render_cache() {
-        let mut app = make_test_app();
-        app.messages = vec![
-            ChatMessage::new(
-                MessageRole::Assistant,
-                vec![assistant_text_block(&"a".repeat(4000))],
-                None,
-            ),
-            ChatMessage::new(
-                MessageRole::Assistant,
-                vec![assistant_text_block(&"b".repeat(4000))],
-                None,
-            ),
-        ];
-
-        let spinner = crate::ui::SpinnerState {
-            frame: 0,
-            is_active_turn_assistant: false,
-            show_empty_thinking: false,
-            show_thinking: false,
-            show_compacting: false,
-        };
-
-        let _ = crate::ui::measure_message_height_cached(&mut app.messages[0], &spinner, 80, 1);
-        let _ = crate::ui::measure_message_height_cached(&mut app.messages[1], &spinner, 80, 1);
-
-        let bytes_a = app.messages[0].render_cache.cached_bytes();
-        let bytes_b = app.messages[1].render_cache.cached_bytes();
-        assert!(bytes_a > 0);
-        assert!(bytes_b > 0);
-
-        app.rebuild_render_cache_accounting();
-        app.render_cache_budget.max_bytes = bytes_b;
-        let stats = app.enforce_render_cache_budget();
-
-        assert!(stats.evicted_bytes >= bytes_a);
-        assert!(
-            app.messages[0].render_cache.cached_bytes() == 0
-                || app.messages[1].render_cache.cached_bytes() == 0
-        );
-    }
-
-    #[test]
     fn enforce_history_retention_noop_under_budget() {
         let mut app = make_test_app();
         app.messages = vec![
@@ -2066,37 +2052,6 @@ mod tests {
 
     #[allow(clippy::cast_precision_loss)]
     #[test]
-    fn enforce_history_retention_preserves_manual_scroll_anchor_across_drop_and_marker_insert() {
-        let mut app = make_test_app();
-        app.messages = vec![
-            ChatMessage::welcome(env!("CARGO_PKG_VERSION"), "-", "/cwd", "-"),
-            user_text_message("drop me first"),
-            user_text_message("keep this anchored"),
-            user_text_message("tail"),
-        ];
-        let _ = app.viewport.on_frame(40, 12);
-        app.viewport.sync_message_count(app.messages.len());
-        for idx in 0..app.messages.len() {
-            app.viewport.set_message_height(idx, 4);
-        }
-        app.viewport.mark_heights_valid();
-        app.viewport.rebuild_prefix_sums();
-
-        app.viewport.auto_scroll = false;
-        app.viewport.scroll_offset = 9;
-        app.viewport.scroll_target = 9;
-        app.viewport.scroll_pos = 9.0;
-        app.history_retention.max_bytes = app
-            .measure_history_bytes()
-            .saturating_sub(App::measure_message_bytes(&app.messages[1]));
-
-        let _ = app.enforce_history_retention();
-
-        assert!(app.messages.iter().any(App::is_history_hidden_marker_message));
-        assert_eq!(app.viewport.scroll_anchor_to_restore(), Some((2, 1)));
-    }
-
-    #[test]
     fn lookup_missing_returns_none() {
         let app = make_test_app();
         assert!(app.lookup_tool_call("nonexistent").is_none());
@@ -2257,49 +2212,6 @@ mod tests {
     }
 
     #[test]
-    fn insert_message_tracked_nontail_rebuilds_tool_indices_and_invalidates_suffix() {
-        let mut app = make_test_app();
-        app.messages.push(user_text_message("before"));
-        app.messages.push(assistant_tool_message("tool-1", model::ToolCallStatus::Completed));
-        app.messages.push(user_text_message("after"));
-        app.index_tool_call("tool-1".to_owned(), 1, 0);
-
-        let _ = app.viewport.on_frame(80, 24);
-        app.viewport.sync_message_count(3);
-        app.viewport.mark_heights_valid();
-        app.viewport.rebuild_prefix_sums();
-
-        app.insert_message_tracked(1, user_text_message("inserted"));
-        app.viewport.sync_message_count(app.messages.len());
-
-        assert_eq!(app.lookup_tool_call("tool-1"), Some((2, 0)));
-        assert_eq!(app.viewport.oldest_stale_index(), Some(1));
-        assert_eq!(app.viewport.prefix_dirty_from(), Some(1));
-    }
-
-    #[test]
-    fn remove_message_tracked_nontail_rebuilds_tool_indices_and_invalidates_suffix() {
-        let mut app = make_test_app();
-        app.messages.push(user_text_message("before"));
-        app.messages.push(assistant_tool_message("tool-1", model::ToolCallStatus::Completed));
-        app.messages.push(user_text_message("after"));
-        app.index_tool_call("tool-1".to_owned(), 1, 0);
-
-        let _ = app.viewport.on_frame(80, 24);
-        app.viewport.sync_message_count(3);
-        app.viewport.mark_heights_valid();
-        app.viewport.rebuild_prefix_sums();
-
-        let removed = app.remove_message_tracked(0);
-        app.viewport.sync_message_count(app.messages.len());
-
-        assert!(removed.is_some());
-        assert_eq!(app.lookup_tool_call("tool-1"), Some((0, 0)));
-        assert_eq!(app.viewport.oldest_stale_index(), Some(0));
-        assert_eq!(app.viewport.prefix_dirty_from(), Some(0));
-    }
-
-    #[test]
     fn remove_message_tracked_tail_removes_orphaned_tool_indices() {
         let mut app = make_test_app();
         app.messages.push(user_text_message("before"));
@@ -2364,27 +2276,6 @@ mod tests {
 
         assert!(app.terminal_tool_calls.is_empty());
         assert!(app.terminal_tool_call_membership.is_empty());
-    }
-
-    #[test]
-    fn finalize_in_progress_tool_calls_invalidates_all_changed_messages() {
-        let mut app = make_test_app();
-        app.messages.push(assistant_tool_message("tool-1", model::ToolCallStatus::InProgress));
-        app.messages.push(user_text_message("gap"));
-        app.messages.push(assistant_tool_message("tool-2", model::ToolCallStatus::InProgress));
-
-        let _ = app.viewport.on_frame(80, 24);
-        app.viewport.sync_message_count(3);
-        app.viewport.mark_heights_valid();
-        app.viewport.rebuild_prefix_sums();
-
-        let changed = app.finalize_in_progress_tool_calls(model::ToolCallStatus::Completed);
-
-        assert_eq!(changed, 2);
-        assert!(!app.viewport.message_height_is_current(0));
-        assert!(app.viewport.message_height_is_current(1));
-        assert!(!app.viewport.message_height_is_current(2));
-        assert_eq!(app.viewport.oldest_stale_index(), Some(0));
     }
 
     // IncrementalMarkdown
@@ -2511,477 +2402,8 @@ mod tests {
         assert_eq!(incr.full_text(), "Here is some text.\n\nNext paragraph here.\n\nFinal.");
     }
 
-    // ChatViewport
-
-    #[test]
-    fn viewport_new_defaults() {
-        let vp = ChatViewport::new();
-        assert_eq!(vp.scroll_offset, 0);
-        assert_eq!(vp.scroll_target, 0);
-        assert!(vp.auto_scroll);
-        assert_eq!(vp.width, 0);
-        assert!(vp.message_heights.is_empty());
-        assert!(vp.oldest_stale_index().is_none());
-        assert!(!vp.resize_remeasure_active());
-        assert!(vp.height_prefix_sums.is_empty());
-    }
-
-    #[test]
-    fn viewport_on_frame_sets_width() {
-        let mut vp = ChatViewport::new();
-        let _ = vp.on_frame(80, 24);
-        assert_eq!(vp.width, 80);
-        assert_eq!(vp.height, 24);
-    }
-
-    #[test]
-    fn viewport_on_frame_resize_invalidates() {
-        let mut vp = ChatViewport::new();
-        let _ = vp.on_frame(80, 24);
-        vp.set_message_height(0, 10);
-        vp.set_message_height(1, 20);
-        vp.rebuild_prefix_sums();
-
-        // Resize: old heights are kept as approximations,
-        // but width markers are invalidated so re-measurement happens.
-        let _ = vp.on_frame(120, 24);
-        assert_eq!(vp.message_height(0), 10); // kept, not zeroed
-        assert_eq!(vp.message_height(1), 20); // kept, not zeroed
-        assert_eq!(vp.message_heights_width, 0); // forces re-measure
-        assert_eq!(vp.prefix_sums_width, 0); // forces rebuild
-    }
-
-    #[test]
-    fn viewport_on_frame_same_width_no_invalidation() {
-        let mut vp = ChatViewport::new();
-        let _ = vp.on_frame(80, 24);
-        vp.set_message_height(0, 10);
-        let _ = vp.on_frame(80, 24); // same width
-        assert_eq!(vp.message_height(0), 10); // not zeroed
-    }
-
-    #[test]
-    fn viewport_on_frame_height_change_preserves_message_measurements() {
-        let mut vp = ChatViewport::new();
-        let _ = vp.on_frame(80, 24);
-        vp.sync_message_count(2);
-        vp.set_message_height(0, 10);
-        vp.set_message_height(1, 20);
-        vp.mark_heights_valid();
-        vp.rebuild_prefix_sums();
-
-        let change = vp.on_frame(80, 12);
-
-        assert!(!change.width_changed);
-        assert!(change.height_changed);
-        assert_eq!(vp.height, 12);
-        assert_eq!(vp.message_heights_width, 80);
-        assert_eq!(vp.prefix_sums_width, 80);
-        assert!(!vp.resize_remeasure_active());
-        assert!(vp.message_height_is_current(0));
-        assert!(vp.message_height_is_current(1));
-    }
-
-    #[test]
-    fn viewport_message_height_set_and_get() {
-        let mut vp = ChatViewport::new();
-        let _ = vp.on_frame(80, 24);
-        vp.set_message_height(0, 5);
-        vp.set_message_height(1, 10);
-        assert_eq!(vp.message_height(0), 5);
-        assert_eq!(vp.message_height(1), 10);
-        assert_eq!(vp.message_height(2), 0); // out of bounds
-    }
-
-    #[test]
-    fn viewport_message_height_grows_vec() {
-        let mut vp = ChatViewport::new();
-        let _ = vp.on_frame(80, 24);
-        vp.set_message_height(5, 42);
-        assert_eq!(vp.message_heights.len(), 6);
-        assert_eq!(vp.message_height(5), 42);
-        assert_eq!(vp.message_height(3), 0); // gap filled with 0
-    }
-
-    #[test]
-    fn viewport_invalidate_message_tracks_oldest_index() {
-        let mut vp = ChatViewport::new();
-        vp.sync_message_count(8);
-        vp.mark_heights_valid();
-        vp.invalidate_message(5);
-        vp.invalidate_message(2);
-        vp.invalidate_message(7);
-        assert_eq!(vp.oldest_stale_index(), Some(2));
-    }
-
-    #[test]
-    fn viewport_mark_heights_valid_clears_dirty_index() {
-        let mut vp = ChatViewport::new();
-        let _ = vp.on_frame(80, 24);
-        vp.sync_message_count(2);
-        vp.mark_heights_valid();
-        vp.invalidate_message(1);
-        assert_eq!(vp.oldest_stale_index(), Some(1));
-        vp.mark_heights_valid();
-        assert!(vp.oldest_stale_index().is_none());
-    }
-
-    #[test]
-    fn viewport_resize_remeasure_tracks_partial_exactness() {
-        let mut vp = ChatViewport::new();
-        let _ = vp.on_frame(80, 24);
-        vp.sync_message_count(3);
-        vp.set_message_height(0, 4);
-        vp.set_message_height(1, 5);
-        vp.set_message_height(2, 6);
-        vp.mark_heights_valid();
-
-        let _ = vp.on_frame(120, 24);
-        assert!(vp.resize_remeasure_active());
-        assert!(!vp.message_height_is_current(0));
-
-        vp.mark_message_height_measured(1);
-        assert!(vp.message_height_is_current(1));
-        assert!(!vp.message_height_is_current(0));
-
-        vp.mark_heights_valid();
-        assert_eq!(vp.message_heights_width, 120);
-        assert!(vp.message_height_is_current(0));
-        assert!(!vp.resize_remeasure_active());
-    }
-
-    #[test]
-    fn viewport_resize_remeasure_expands_outward_from_anchor() {
-        let mut vp = ChatViewport::new();
-        let _ = vp.on_frame(80, 24);
-        vp.sync_message_count(6);
-        vp.mark_heights_valid();
-
-        let _ = vp.on_frame(100, 24);
-        vp.ensure_resize_remeasure_anchor(2, 3, 6);
-
-        assert_eq!(vp.next_resize_remeasure_index(6), Some(1));
-        assert_eq!(vp.next_resize_remeasure_index(6), Some(0));
-        assert_eq!(vp.next_resize_remeasure_index(6), Some(4));
-        assert_eq!(vp.next_resize_remeasure_index(6), Some(5));
-        assert_eq!(vp.next_resize_remeasure_index(6), None);
-        assert!(!vp.resize_remeasure_active());
-    }
-
-    #[allow(clippy::cast_precision_loss)]
-    #[test]
-    fn viewport_restore_resize_anchor_keeps_same_message_visible() {
-        let mut vp = ChatViewport::new();
-        let _ = vp.on_frame(80, 24);
-        vp.sync_message_count(4);
-        for idx in 0..4 {
-            vp.set_message_height(idx, 5);
-        }
-        vp.mark_heights_valid();
-        vp.rebuild_prefix_sums();
-
-        vp.auto_scroll = false;
-        vp.scroll_offset = 7;
-        vp.scroll_target = 7;
-        vp.scroll_pos = 7.0;
-
-        let _ = vp.on_frame(40, 24);
-        let (anchor_idx, anchor_offset) =
-            vp.resize_scroll_anchor().expect("resize should snapshot a scroll anchor");
-        assert_eq!((anchor_idx, anchor_offset), (1, 2));
-
-        vp.set_message_height(0, 12);
-        vp.set_message_height(1, 8);
-        vp.set_message_height(2, 6);
-        vp.set_message_height(3, 6);
-        vp.prefix_sums_width = 0;
-        vp.rebuild_prefix_sums();
-        vp.restore_scroll_anchor(anchor_idx, anchor_offset);
-
-        assert_eq!(vp.scroll_offset, 14);
-        assert_eq!(vp.find_first_visible(vp.scroll_offset), 1);
-    }
-
-    #[allow(clippy::cast_precision_loss)]
-    #[test]
-    fn viewport_preserves_resize_anchor_when_followup_remeasure_replaces_plan() {
-        let mut vp = ChatViewport::new();
-        let _ = vp.on_frame(80, 24);
-        vp.sync_message_count(4);
-        for idx in 0..4 {
-            vp.set_message_height(idx, 5);
-        }
-        vp.mark_heights_valid();
-        vp.rebuild_prefix_sums();
-
-        vp.auto_scroll = false;
-        vp.scroll_offset = 7;
-        vp.scroll_target = 7;
-        vp.scroll_pos = 7.0;
-
-        let _ = vp.on_frame(40, 24);
-        let resize_anchor = vp.resize_scroll_anchor().expect("resize should preserve an anchor");
-        assert_eq!(resize_anchor, (1, 2));
-        assert_eq!(vp.remeasure_reason(), Some(LayoutRemeasureReason::Resize));
-
-        vp.invalidate_messages_from(0);
-
-        assert_eq!(vp.remeasure_reason(), Some(LayoutRemeasureReason::MessagesFrom));
-        assert_eq!(vp.resize_scroll_anchor(), Some(resize_anchor));
-        assert_eq!(vp.scroll_anchor_to_restore(), Some(resize_anchor));
-    }
-
-    #[allow(clippy::cast_precision_loss)]
-    #[test]
-    fn viewport_message_change_preserves_manual_anchor() {
-        let mut vp = ChatViewport::new();
-        let _ = vp.on_frame(80, 24);
-        vp.sync_message_count(4);
-        for idx in 0..4 {
-            vp.set_message_height(idx, 5);
-        }
-        vp.mark_heights_valid();
-        vp.rebuild_prefix_sums();
-
-        vp.auto_scroll = false;
-        vp.scroll_offset = 7;
-        vp.scroll_target = 7;
-        vp.scroll_pos = 7.0;
-
-        vp.invalidate_message(0);
-
-        let anchor =
-            vp.scroll_anchor_to_restore().expect("manual scroll should preserve an anchor");
-        assert_eq!(anchor, (1, 2));
-
-        vp.set_message_height(0, 12);
-        vp.mark_message_height_measured(0);
-        vp.rebuild_prefix_sums();
-        assert_eq!(vp.ready_scroll_anchor_to_restore(), Some(anchor));
-
-        vp.restore_scroll_anchor(anchor.0, anchor.1);
-        assert_eq!(vp.scroll_offset, 14);
-        assert_eq!(vp.find_first_visible(vp.scroll_offset), 1);
-    }
-
-    #[allow(clippy::cast_precision_loss)]
-    #[test]
-    fn viewport_delays_anchor_restore_until_prefix_above_is_exact() {
-        let mut vp = ChatViewport::new();
-        let _ = vp.on_frame(80, 24);
-        vp.sync_message_count(4);
-        for idx in 0..4 {
-            vp.set_message_height(idx, 5);
-        }
-        vp.mark_heights_valid();
-        vp.rebuild_prefix_sums();
-
-        vp.auto_scroll = false;
-        vp.scroll_offset = 12;
-        vp.scroll_target = 12;
-        vp.scroll_pos = 12.0;
-
-        let _ = vp.on_frame(40, 24);
-        let anchor = vp.resize_scroll_anchor().expect("resize should preserve an anchor");
-        assert_eq!(anchor, (2, 2));
-        assert_eq!(vp.scroll_anchor_to_restore(), Some(anchor));
-        assert_eq!(vp.ready_scroll_anchor_to_restore(), None);
-
-        vp.set_message_height(2, 9);
-        vp.mark_message_height_measured(2);
-        vp.rebuild_prefix_sums();
-        assert_eq!(vp.ready_scroll_anchor_to_restore(), None);
-
-        vp.set_message_height(0, 11);
-        vp.mark_message_height_measured(0);
-        vp.set_message_height(1, 8);
-        vp.mark_message_height_measured(1);
-        vp.rebuild_prefix_sums();
-
-        assert_eq!(vp.ready_scroll_anchor_to_restore(), Some(anchor));
-    }
-
-    #[test]
-    fn viewport_prioritizes_rows_above_preserved_anchor_until_restore_is_exact() {
-        let mut vp = ChatViewport::new();
-        let _ = vp.on_frame(80, 24);
-        vp.sync_message_count(6);
-        for idx in 0..6 {
-            vp.set_message_height(idx, 5);
-        }
-        vp.mark_heights_valid();
-        vp.rebuild_prefix_sums();
-
-        vp.auto_scroll = false;
-        vp.scroll_offset = 12;
-        vp.scroll_target = 12;
-        vp.scroll_pos = 12.0;
-
-        let _ = vp.on_frame(40, 24);
-        vp.ensure_resize_remeasure_anchor(2, 3, 6);
-
-        assert_eq!(vp.next_resize_remeasure_index(6), Some(1));
-        assert_eq!(vp.next_resize_remeasure_index(6), Some(0));
-        assert_eq!(vp.next_resize_remeasure_index(6), Some(4));
-    }
-
-    #[allow(clippy::cast_precision_loss)]
-    #[test]
-    fn viewport_global_remeasure_preserves_anchor_while_prefix_above_converges() {
-        let mut vp = ChatViewport::new();
-        let _ = vp.on_frame(80, 24);
-        vp.sync_message_count(6);
-        for idx in 0..6 {
-            vp.set_message_height(idx, 5);
-        }
-        vp.mark_heights_valid();
-        vp.rebuild_prefix_sums();
-
-        vp.auto_scroll = false;
-        vp.scroll_offset = 17;
-        vp.scroll_target = 17;
-        vp.scroll_pos = 17.0;
-
-        vp.invalidate_all_messages(LayoutRemeasureReason::Global);
-        let anchor =
-            vp.scroll_anchor_to_restore().expect("global remeasure should preserve an anchor");
-        assert_eq!(anchor, (3, 2));
-
-        vp.invalidate_message(5);
-
-        assert_eq!(vp.remeasure_reason(), Some(LayoutRemeasureReason::MessageChanged));
-        assert_eq!(vp.scroll_anchor_to_restore(), Some(anchor));
-
-        vp.set_message_height(0, 12);
-        vp.mark_message_height_measured(0);
-        vp.set_message_height(1, 8);
-        vp.mark_message_height_measured(1);
-        vp.rebuild_prefix_sums();
-
-        assert_eq!(vp.find_first_visible(vp.scroll_offset), 1);
-
-        vp.restore_scroll_anchor(anchor.0, anchor.1);
-
-        assert_eq!(vp.find_first_visible(vp.scroll_offset), 3);
-        assert_eq!(vp.scroll_offset, 27);
-    }
-
-    #[test]
-    fn viewport_prefix_sums_basic() {
-        let mut vp = ChatViewport::new();
-        let _ = vp.on_frame(80, 24);
-        vp.set_message_height(0, 5);
-        vp.set_message_height(1, 10);
-        vp.set_message_height(2, 3);
-        vp.rebuild_prefix_sums();
-        assert_eq!(vp.total_message_height(), 18);
-        assert_eq!(vp.cumulative_height_before(0), 0);
-        assert_eq!(vp.cumulative_height_before(1), 5);
-        assert_eq!(vp.cumulative_height_before(2), 15);
-    }
-
-    #[test]
-    fn viewport_prefix_sums_streaming_fast_path() {
-        let mut vp = ChatViewport::new();
-        let _ = vp.on_frame(80, 24);
-        vp.set_message_height(0, 5);
-        vp.set_message_height(1, 10);
-        vp.rebuild_prefix_sums();
-        assert_eq!(vp.total_message_height(), 15);
-
-        // Simulate streaming: last message grows
-        vp.set_message_height(1, 20);
-        vp.rebuild_prefix_sums(); // should hit fast path
-        assert_eq!(vp.total_message_height(), 25);
-        assert_eq!(vp.cumulative_height_before(1), 5);
-    }
-
-    #[test]
-    fn viewport_find_first_visible() {
-        let mut vp = ChatViewport::new();
-        let _ = vp.on_frame(80, 24);
-        vp.set_message_height(0, 10);
-        vp.set_message_height(1, 10);
-        vp.set_message_height(2, 10);
-        vp.rebuild_prefix_sums();
-
-        assert_eq!(vp.find_first_visible(0), 0);
-        assert_eq!(vp.find_first_visible(10), 1);
-        assert_eq!(vp.find_first_visible(15), 1);
-        assert_eq!(vp.find_first_visible(20), 2);
-    }
-
-    #[test]
-    fn viewport_find_first_visible_handles_offsets_before_first_boundary() {
-        let mut vp = ChatViewport::new();
-        let _ = vp.on_frame(80, 24);
-        vp.set_message_height(0, 10);
-        vp.set_message_height(1, 10);
-        vp.rebuild_prefix_sums();
-
-        assert_eq!(vp.find_first_visible(0), 0);
-        assert_eq!(vp.find_first_visible(5), 0);
-        assert_eq!(vp.find_first_visible(15), 1);
-    }
-
-    #[test]
-    fn viewport_scroll_up_down() {
-        let mut vp = ChatViewport::new();
-        vp.scroll_target = 20;
-        vp.scroll_pos = 20.0;
-        vp.scroll_offset = 20;
-        vp.auto_scroll = true;
-
-        vp.scroll_up(5);
-        assert_eq!(vp.scroll_target, 15);
-        assert!((vp.scroll_pos - 15.0).abs() < f32::EPSILON);
-        assert_eq!(vp.scroll_offset, 15);
-        assert!(!vp.auto_scroll); // disabled on manual scroll
-
-        vp.scroll_down(3);
-        assert_eq!(vp.scroll_target, 18);
-        assert!((vp.scroll_pos - 18.0).abs() < f32::EPSILON);
-        assert_eq!(vp.scroll_offset, 18);
-        assert!(!vp.auto_scroll); // not re-engaged by scroll_down
-    }
-
-    #[test]
-    fn viewport_scroll_up_saturates() {
-        let mut vp = ChatViewport::new();
-        vp.scroll_target = 2;
-        vp.scroll_pos = 2.0;
-        vp.scroll_offset = 2;
-        vp.scroll_up(10);
-        assert_eq!(vp.scroll_target, 0);
-        assert!(vp.scroll_pos.abs() < f32::EPSILON);
-        assert_eq!(vp.scroll_offset, 0);
-    }
-
-    #[test]
-    fn viewport_engage_auto_scroll() {
-        let mut vp = ChatViewport::new();
-        vp.auto_scroll = false;
-        vp.engage_auto_scroll();
-        assert!(vp.auto_scroll);
-    }
-
-    #[test]
-    fn viewport_default_eq_new() {
-        let a = ChatViewport::new();
-        let b = ChatViewport::default();
-        assert_eq!(a.width, b.width);
-        assert_eq!(a.auto_scroll, b.auto_scroll);
-        assert_eq!(a.message_heights.len(), b.message_heights.len());
-    }
-
     fn focus_test_app_with_available_targets() -> App {
         let mut app = make_test_app();
-        app.todos.push(TodoItem {
-            content: "Task".into(),
-            status: TodoStatus::Pending,
-            active_form: String::new(),
-        });
-        app.show_todo_panel = true;
         app.pending_interaction_ids.push("perm-1".into());
         app.slash = Some(SlashState {
             trigger_row: 0,
@@ -2993,7 +2415,7 @@ mod tests {
                 primary: "/config".into(),
                 secondary: Some("Open settings".into()),
             }],
-            dialog: dialog::DialogState::default(),
+            dialog: crate::app::dialog::DialogState::default(),
         });
         app
     }
@@ -3003,9 +2425,6 @@ mod tests {
         let mut app = focus_test_app_with_available_targets();
 
         assert_eq!(app.focus_owner(), FocusOwner::Input);
-
-        app.claim_focus_target(FocusTarget::TodoList);
-        assert_eq!(app.focus_owner(), FocusOwner::TodoList);
 
         app.claim_focus_target(FocusTarget::Permission);
         assert_eq!(app.focus_owner(), FocusOwner::Permission);
@@ -3017,160 +2436,15 @@ mod tests {
         assert_eq!(app.focus_owner(), FocusOwner::Permission);
 
         app.release_focus_target(FocusTarget::Permission);
-        assert_eq!(app.focus_owner(), FocusOwner::TodoList);
-
-        app.release_focus_target(FocusTarget::TodoList);
         assert_eq!(app.focus_owner(), FocusOwner::Input);
     }
 
     #[test]
     fn focus_owner_falls_back_to_input_when_claimed_target_is_unavailable() {
         let mut app = make_test_app();
-        app.claim_focus_target(FocusTarget::TodoList);
+        app.claim_focus_target(FocusTarget::Permission);
         assert_eq!(app.focus_owner(), FocusOwner::Input);
     }
 
     // --- InvalidationLevel tests ---
-
-    #[test]
-    fn invalidate_single_tail_preserves_prefix_sums() {
-        let mut app = make_test_app();
-        app.messages.push(user_text_message("a"));
-        app.messages.push(user_text_message("b"));
-        app.messages.push(user_text_message("c"));
-        let _ = app.viewport.on_frame(80, 24);
-        app.viewport.set_message_height(0, 5);
-        app.viewport.set_message_height(1, 10);
-        app.viewport.set_message_height(2, 3);
-        app.viewport.mark_heights_valid();
-        app.viewport.rebuild_prefix_sums();
-
-        app.invalidate_layout(InvalidationLevel::MessageChanged(2)); // tail
-
-        assert_eq!(app.viewport.oldest_stale_index(), Some(2));
-        assert_eq!(app.viewport.prefix_dirty_from(), Some(2));
-        assert_eq!(app.viewport.prefix_sums_width, 0);
-    }
-
-    #[test]
-    fn invalidate_single_nontail_invalidates_prefix_sums() {
-        let mut app = make_test_app();
-        app.messages.push(user_text_message("a"));
-        app.messages.push(user_text_message("b"));
-        app.messages.push(user_text_message("c"));
-        let _ = app.viewport.on_frame(80, 24);
-        app.viewport.set_message_height(0, 5);
-        app.viewport.set_message_height(1, 10);
-        app.viewport.set_message_height(2, 3);
-        app.viewport.mark_heights_valid();
-        app.viewport.rebuild_prefix_sums();
-
-        app.invalidate_layout(InvalidationLevel::MessageChanged(1)); // non-tail
-
-        assert_eq!(app.viewport.oldest_stale_index(), Some(1));
-        assert_eq!(app.viewport.prefix_dirty_from(), Some(1));
-        assert_eq!(app.viewport.prefix_sums_width, 0);
-    }
-
-    #[test]
-    fn invalidate_from_always_invalidates_prefix_sums() {
-        let mut app = make_test_app();
-        app.messages.push(user_text_message("a"));
-        app.messages.push(user_text_message("b"));
-        app.messages.push(user_text_message("c"));
-        let _ = app.viewport.on_frame(80, 24);
-        app.viewport.set_message_height(0, 5);
-        app.viewport.set_message_height(1, 10);
-        app.viewport.set_message_height(2, 3);
-        app.viewport.mark_heights_valid();
-        app.viewport.rebuild_prefix_sums();
-        assert_ne!(app.viewport.prefix_sums_width, 0);
-
-        // From at tail index still invalidates prefix sums (unlike Single).
-        app.invalidate_layout(InvalidationLevel::MessagesFrom(2));
-
-        assert_eq!(app.viewport.oldest_stale_index(), Some(2));
-        assert_eq!(app.viewport.prefix_dirty_from(), Some(2));
-        assert_eq!(app.viewport.prefix_sums_width, 0);
-    }
-
-    #[test]
-    fn invalidate_from_zero_matches_old_mark_all() {
-        let mut app = make_test_app();
-        app.messages.push(user_text_message("a"));
-        app.messages.push(user_text_message("b"));
-        app.messages.push(user_text_message("c"));
-        let _ = app.viewport.on_frame(80, 24);
-        app.viewport.set_message_height(0, 5);
-        app.viewport.set_message_height(1, 10);
-        app.viewport.set_message_height(2, 3);
-        app.viewport.mark_heights_valid();
-        app.viewport.rebuild_prefix_sums();
-
-        app.invalidate_layout(InvalidationLevel::MessagesFrom(0));
-
-        assert_eq!(app.viewport.oldest_stale_index(), Some(0));
-        assert_eq!(app.viewport.prefix_dirty_from(), Some(0));
-        assert_eq!(app.viewport.prefix_sums_width, 0);
-    }
-
-    #[test]
-    fn invalidate_global_bumps_generation() {
-        let mut app = make_test_app();
-        app.messages.push(user_text_message("a"));
-        app.messages.push(user_text_message("b"));
-        app.messages.push(user_text_message("c"));
-        let _ = app.viewport.on_frame(80, 24);
-        app.viewport.sync_message_count(3);
-        app.viewport.mark_heights_valid();
-        app.viewport.rebuild_prefix_sums();
-        let gen_before = app.viewport.layout_generation;
-
-        app.invalidate_layout(InvalidationLevel::Global);
-
-        assert_eq!(app.viewport.oldest_stale_index(), Some(0));
-        assert_eq!(app.viewport.prefix_dirty_from(), Some(0));
-        assert_eq!(app.viewport.prefix_sums_width, 0);
-        assert_eq!(app.viewport.layout_generation, gen_before + 1);
-    }
-
-    #[test]
-    fn invalidate_global_noop_on_empty() {
-        let mut app = make_test_app();
-        assert!(app.messages.is_empty());
-        let gen_before = app.viewport.layout_generation;
-
-        app.invalidate_layout(InvalidationLevel::Global);
-
-        assert!(app.viewport.oldest_stale_index().is_none());
-        assert_eq!(app.viewport.layout_generation, gen_before);
-    }
-
-    #[test]
-    fn invalidate_message_tracks_oldest_stale_index() {
-        let mut app = make_test_app();
-        // Need enough messages so all indices are non-tail for consistent behavior.
-        for _ in 0..10 {
-            app.messages.push(user_text_message("x"));
-        }
-        app.viewport.sync_message_count(10);
-        app.viewport.mark_heights_valid();
-
-        app.invalidate_layout(InvalidationLevel::MessageChanged(5));
-        app.invalidate_layout(InvalidationLevel::MessageChanged(2));
-        app.invalidate_layout(InvalidationLevel::MessageChanged(7));
-
-        assert_eq!(app.viewport.oldest_stale_index(), Some(2));
-    }
-
-    #[test]
-    fn invalidation_level_eq_and_debug() {
-        assert_eq!(InvalidationLevel::MessageChanged(5), InvalidationLevel::MessageChanged(5));
-        assert_ne!(InvalidationLevel::MessageChanged(5), InvalidationLevel::MessagesFrom(5));
-        assert_eq!(InvalidationLevel::Global, InvalidationLevel::Global);
-        assert_eq!(InvalidationLevel::Resize, InvalidationLevel::Resize);
-        // Debug derive works
-        let dbg = format!("{:?}", InvalidationLevel::MessagesFrom(3));
-        assert!(dbg.contains("MessagesFrom"));
-    }
 }

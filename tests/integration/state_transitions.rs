@@ -1,5 +1,5 @@
 // =====
-// TESTS: 19
+// TESTS: 20
 // =====
 //
 // State transition integration tests.
@@ -13,6 +13,32 @@ use pretty_assertions::assert_eq;
 use crate::helpers::{send_client_event, test_app};
 
 // --- Full turn lifecycle ---
+
+#[tokio::test]
+async fn agent_thought_chunk_sets_thinking_without_writing_transcript() {
+    let mut app = test_app();
+    let original_message_count = app.messages.len();
+    let thought_text = "Planning...";
+    let thought =
+        model::ContentChunk::new(model::ContentBlock::Text(model::TextContent::new(thought_text)));
+
+    send_client_event(
+        &mut app,
+        ClientEvent::SessionUpdate(model::SessionUpdate::AgentThoughtChunk(thought)),
+    );
+
+    assert!(matches!(app.status, AppStatus::Thinking));
+    assert_eq!(app.messages.len(), original_message_count);
+    assert!(
+        !app.messages.iter().any(|message| {
+            message.blocks.iter().any(|block| match block {
+                MessageBlock::Text(text) => text.text.contains(thought_text),
+                _ => false,
+            })
+        }),
+        "thought chunks should not be persisted as transcript message text"
+    );
+}
 
 #[tokio::test]
 async fn full_turn_lifecycle_text_only() {
@@ -112,8 +138,6 @@ async fn todowrite_tool_call_updates_todo_list() {
     assert_eq!(app.todos.len(), 2);
     assert_eq!(app.todos[0].content, "Fix bug");
     assert_eq!(app.todos[1].content, "Write tests");
-    // show_todo_panel is user-toggled (Ctrl+T), not auto-shown on TodoWrite
-    assert!(!app.show_todo_panel);
 }
 
 #[tokio::test]
@@ -167,7 +191,6 @@ async fn todowrite_replaces_previous_items_and_clears_for_terminal_payloads() {
     );
 
     assert!(app.todos.is_empty(), "all-completed clears the list");
-    assert!(!app.show_todo_panel, "panel hidden when all done");
 }
 
 // --- Error recovery ---
@@ -251,26 +274,6 @@ async fn tool_call_content_update() {
     } else {
         panic!("expected ToolCall block");
     }
-}
-
-// --- Auto-scroll ---
-
-#[tokio::test]
-async fn auto_scroll_maintained_during_streaming() {
-    let mut app = test_app();
-    assert!(app.viewport.auto_scroll);
-
-    for _ in 0..20 {
-        let chunk = model::ContentChunk::new(model::ContentBlock::Text(model::TextContent::new(
-            "More text. ",
-        )));
-        send_client_event(
-            &mut app,
-            ClientEvent::SessionUpdate(model::SessionUpdate::AgentMessageChunk(chunk)),
-        );
-    }
-
-    assert!(app.viewport.auto_scroll, "auto_scroll should stay true during streaming");
 }
 
 // --- Stress: many tool calls in one turn ---

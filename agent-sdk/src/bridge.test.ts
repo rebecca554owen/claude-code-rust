@@ -54,6 +54,15 @@ import { emitToolProgressUpdate } from "./bridge/tool_calls.js";
 import { requestAskUserQuestionAnswers } from "./bridge/user_interaction.js";
 import { handleResultMessage } from "./bridge/message_handlers.js";
 
+const BRIDGE_RUNTIME_PROCESS_NAME =
+  process.platform === "win32" ? "claude-rs-bridge-node.exe" : "claude-rs-bridge-node";
+const BRIDGE_RUNTIME_GUARD_PROMPT =
+  `Do not terminate the Claude Rust bridge runtime process \`${BRIDGE_RUNTIME_PROCESS_NAME}\`; ` +
+  "when cleaning up development servers, only stop processes by explicit PIDs you started in this session.";
+const GERMAN_LANGUAGE_PROMPT =
+  "Always respond to the user in German unless the user explicitly asks for a different language. " +
+  "Keep code, shell commands, file paths, API names, tool names, and raw error text unchanged unless the user explicitly asks for translation.";
+
 function makeSessionState(): SessionState {
   const input = new AsyncQueue<import("@anthropic-ai/claude-agent-sdk").SDKUserMessage>();
   return {
@@ -76,6 +85,7 @@ function makeSessionState(): SessionState {
     pendingQuestions: new Map(),
     pendingElicitations: new Map(),
     mcpStatusRevalidatedAt: new Map(),
+    hiddenToolUseIds: new Set(),
     authHintSent: false,
   };
 }
@@ -581,9 +591,7 @@ test("buildQueryOptions maps launch settings into sdk query options", () => {
   assert.deepEqual(options.systemPrompt, {
     type: "preset",
     preset: "claude_code",
-    append:
-      "Always respond to the user in German unless the user explicitly asks for a different language. " +
-      "Keep code, shell commands, file paths, API names, tool names, and raw error text unchanged unless the user explicitly asks for translation.",
+    append: `${BRIDGE_RUNTIME_GUARD_PROMPT} ${GERMAN_LANGUAGE_PROMPT}`,
   });
   assert.equal(options.model, "haiku");
   assert.equal(options.permissionMode, "plan");
@@ -702,7 +710,7 @@ test("buildQueryOptions enables dangerous skip flag for bypass permissions start
   assert.equal(options.allowDangerouslySkipPermissions, true);
 });
 
-test("buildQueryOptions omits startup overrides for default logout path", () => {
+test("buildQueryOptions omits optional startup overrides but keeps bridge guard prompt", () => {
   const input = new AsyncQueue<import("@anthropic-ai/claude-agent-sdk").SDKUserMessage>();
   const options = buildQueryOptions({
     cwd: "C:/work",
@@ -718,7 +726,11 @@ test("buildQueryOptions omits startup overrides for default logout path", () => 
   assert.equal("model" in options, false);
   assert.equal("permissionMode" in options, false);
   assert.equal("allowDangerouslySkipPermissions" in options, false);
-  assert.equal("systemPrompt" in options, false);
+  assert.deepEqual(options.systemPrompt, {
+    type: "preset",
+    preset: "claude_code",
+    append: BRIDGE_RUNTIME_GUARD_PROMPT,
+  });
   assert.equal("agentProgressSummaries" in options, false);
 });
 
@@ -893,6 +905,178 @@ test("handleTaskSystemMessage final summary replaces prior task content and fina
     },
   });
   assert.equal(session.taskToolUseIds.has("task-1"), false);
+});
+
+test("handleTaskSystemMessage ignores lifecycle content for concrete output tools", () => {
+  const session = makeSessionState();
+  const protectedTools = [
+    createToolCall("tool-bash", "Bash", { command: "git status" }),
+    createToolCall("tool-read", "Read", { file_path: "src/main.rs" }),
+    createToolCall("tool-write", "Write", {
+      file_path: "src/main.rs",
+      content: "updated file contents",
+    }),
+  ];
+
+  for (const toolCall of protectedTools) {
+    toolCall.status = "in_progress";
+    toolCall.raw_output = `actual output for ${toolCall.tool_call_id}`;
+    session.toolCalls.set(toolCall.tool_call_id, toolCall);
+  }
+
+  const events = captureBridgeEvents(() => {
+    for (const toolCall of protectedTools) {
+      const taskId = `task-${toolCall.tool_call_id}`;
+      handleTaskSystemMessage(session, "task_started", {
+        task_id: taskId,
+        tool_use_id: toolCall.tool_call_id,
+        description: "Show working tree status",
+      });
+      handleTaskSystemMessage(session, "task_notification", {
+        task_id: taskId,
+        tool_use_id: toolCall.tool_call_id,
+        status: "completed",
+        summary: "Show diff summary for unstaged changes",
+      });
+    }
+  });
+
+  assert.deepEqual(events, []);
+  for (const toolCall of protectedTools) {
+    const stored = session.toolCalls.get(toolCall.tool_call_id);
+    assert.equal(stored?.status, "in_progress");
+    assert.equal(stored?.raw_output, `actual output for ${toolCall.tool_call_id}`);
+  }
+});
+
+test("handleSdkMessage ignores tool_use_summary for Bash Read and Write tools", () => {
+  const session = makeSessionState();
+  const protectedTools = [
+    createToolCall("tool-bash", "Bash", { command: "git diff" }),
+    createToolCall("tool-read", "Read", { file_path: "src/main.rs" }),
+    createToolCall("tool-write", "Write", {
+      file_path: "src/main.rs",
+      content: "updated file contents",
+    }),
+  ];
+
+  for (const toolCall of protectedTools) {
+    toolCall.status = "completed";
+    toolCall.raw_output = `actual output for ${toolCall.tool_call_id}`;
+    session.toolCalls.set(toolCall.tool_call_id, toolCall);
+  }
+
+  const events = captureBridgeEvents(() => {
+    handleSdkMessage(session, {
+      type: "tool_use_summary",
+      summary: "Show commits on this branch since diverging from main",
+      preceding_tool_use_ids: protectedTools.map((toolCall) => toolCall.tool_call_id),
+      uuid: "message-summary",
+      session_id: "session-1",
+    } as unknown as import("@anthropic-ai/claude-agent-sdk").SDKMessage);
+  });
+
+  assert.deepEqual(events, []);
+  for (const toolCall of protectedTools) {
+    assert.equal(
+      session.toolCalls.get(toolCall.tool_call_id)?.raw_output,
+      `actual output for ${toolCall.tool_call_id}`,
+    );
+  }
+});
+
+test("handleSdkMessage applies tool_use_summary for summary-oriented tools", () => {
+  const session = makeSessionState();
+  const toolCall = createToolCall("tool-agent", "Agent", { prompt: "Inspect auth flow" });
+  session.toolCalls.set(toolCall.tool_call_id, toolCall);
+
+  const events = captureBridgeEvents(() => {
+    handleSdkMessage(session, {
+      type: "tool_use_summary",
+      summary: "Inspected auth flow and found the failing check",
+      preceding_tool_use_ids: [toolCall.tool_call_id],
+      uuid: "message-summary",
+      session_id: "session-1",
+    } as unknown as import("@anthropic-ai/claude-agent-sdk").SDKMessage);
+  });
+
+  const lastEvent = events.at(-1);
+  assert.ok(lastEvent);
+  assert.equal(lastEvent.event, "session_update");
+  assert.deepEqual(lastEvent.update, {
+    type: "tool_call_update",
+    tool_call_update: {
+      tool_call_id: "tool-agent",
+      fields: {
+        status: "completed",
+        raw_output: "Inspected auth flow and found the failing check",
+        content: [
+          {
+            type: "content",
+            content: { type: "text", text: "Inspected auth flow and found the failing check" },
+          },
+        ],
+      },
+    },
+  });
+  assert.equal(session.toolCalls.get(toolCall.tool_call_id)?.raw_output, "Inspected auth flow and found the failing check");
+});
+
+test("handleSdkMessage suppresses ToolSearch bridge events without denying SDK use", () => {
+  const session = makeSessionState();
+
+  const events = captureBridgeEvents(() => {
+    handleSdkMessage(session, {
+      type: "stream_event",
+      event: {
+        type: "content_block_start",
+        content_block: {
+          type: "server_tool_use",
+          id: "tool-search-1",
+          name: "ToolSearch",
+          input: { query: "src/" },
+        },
+      },
+      uuid: "message-search-start",
+      session_id: "session-1",
+    } as unknown as import("@anthropic-ai/claude-agent-sdk").SDKMessage);
+    handleSdkMessage(session, {
+      type: "tool_progress",
+      tool_use_id: "tool-search-1",
+      tool_name: "ToolSearch",
+      uuid: "message-search-progress",
+      session_id: "session-1",
+    } as unknown as import("@anthropic-ai/claude-agent-sdk").SDKMessage);
+    handleSdkMessage(session, {
+      type: "user",
+      parent_tool_use_id: "tool-search-1",
+      tool_use_result: { content: "matched src/main.rs", is_error: false },
+      message: {
+        role: "user",
+        content: [
+          {
+            type: "tool_search_tool_result",
+            tool_use_id: "tool-search-1",
+            content: "matched src/main.rs",
+            is_error: false,
+          },
+        ],
+      },
+      uuid: "message-search-result",
+      session_id: "session-1",
+    } as unknown as import("@anthropic-ai/claude-agent-sdk").SDKMessage);
+    handleSdkMessage(session, {
+      type: "tool_use_summary",
+      summary: "Found source files",
+      preceding_tool_use_ids: ["tool-search-1"],
+      uuid: "message-search-summary",
+      session_id: "session-1",
+    } as unknown as import("@anthropic-ai/claude-agent-sdk").SDKMessage);
+  });
+
+  assert.deepEqual(events, []);
+  assert.equal(session.hiddenToolUseIds.has("tool-search-1"), true);
+  assert.equal(session.toolCalls.has("tool-search-1"), false);
 });
 
 test("handleTaskSystemMessage applies task_updated description patches to the linked task", () => {
@@ -1070,9 +1254,7 @@ test("buildQueryOptions trims language before appending system prompt", () => {
   assert.deepEqual(options.systemPrompt, {
     type: "preset",
     preset: "claude_code",
-    append:
-      "Always respond to the user in German unless the user explicitly asks for a different language. " +
-      "Keep code, shell commands, file paths, API names, tool names, and raw error text unchanged unless the user explicitly asks for translation.",
+    append: `${BRIDGE_RUNTIME_GUARD_PROMPT} ${GERMAN_LANGUAGE_PROMPT}`,
   });
 });
 
@@ -1373,7 +1555,34 @@ test("buildApiRetryUpdate maps SDK api_retry messages to wire shape", () => {
       error: "unknown",
     },
   );
+  assert.deepEqual(
+    buildApiRetryUpdate({
+      attempt: 1,
+      max_retries: 10,
+      retry_delay_ms: 549.8881698459426,
+      error_status: null,
+      error: "unexpected",
+    }),
+    {
+      type: "api_retry_update",
+      attempt: 1,
+      max_retries: 10,
+      retry_delay_ms: 549.8881698459426,
+      error_status: null,
+      error: "unknown",
+    },
+  );
   assert.equal(buildApiRetryUpdate({ attempt: 1 }), null);
+  assert.equal(
+    buildApiRetryUpdate({
+      attempt: 1,
+      max_retries: 10,
+      retry_delay_ms: -1,
+      error_status: null,
+      error: "server_error",
+    }),
+    null,
+  );
 });
 
 test("normalizeSettingsParseError accepts only SDK-shaped errors", () => {
@@ -2050,7 +2259,7 @@ test("looksLikeAuthRequired detects login hints", () => {
 });
 
 test("agent sdk version compatibility check matches pinned version", () => {
-  assert.equal(resolveInstalledAgentSdkVersion(), "0.2.112");
+  assert.equal(resolveInstalledAgentSdkVersion(), "0.3.146");
   assert.equal(agentSdkVersionCompatibilityError(), undefined);
 });
 
@@ -2114,6 +2323,64 @@ test("mapSessionMessagesToUpdates maps message content blocks", () => {
   assert.equal(variantCounts.get("agent_message_chunk"), 1);
   assert.equal(variantCounts.get("tool_call"), 1);
   assert.equal(variantCounts.get("tool_call_update"), 1);
+});
+
+test("mapSessionMessagesToUpdates suppresses ToolSearch history blocks", () => {
+  const updates = mapSessionMessagesToUpdates([
+    {
+      type: "assistant",
+      uuid: "a1",
+      session_id: "s1",
+      parent_tool_use_id: null,
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "server_tool_use",
+            id: "tool-search-1",
+            name: "ToolSearch",
+            input: { query: "src/" },
+          },
+          { type: "tool_use", id: "tool-bash", name: "Bash", input: { command: "echo ok" } },
+        ],
+      },
+    },
+    {
+      type: "user",
+      uuid: "u1",
+      session_id: "s1",
+      parent_tool_use_id: null,
+      message: {
+        role: "user",
+        content: [
+          {
+            type: "tool_search_tool_result",
+            tool_use_id: "tool-search-1",
+            content: "matched src/main.rs",
+            is_error: false,
+          },
+          {
+            type: "tool_result",
+            tool_use_id: "tool-bash",
+            content: "ok",
+            is_error: false,
+          },
+        ],
+      },
+    },
+  ]);
+
+  const toolCalls = updates.filter((update) => update.type === "tool_call");
+  const toolUpdates = updates.filter((update) => update.type === "tool_call_update");
+
+  assert.deepEqual(
+    toolCalls.map((update) => update.tool_call.tool_call_id),
+    ["tool-bash"],
+  );
+  assert.deepEqual(
+    toolUpdates.map((update) => update.tool_call_update.tool_call_id),
+    ["tool-bash"],
+  );
 });
 
 test("mapSessionMessagesToUpdates preserves parallel tool results", () => {

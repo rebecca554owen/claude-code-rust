@@ -1,10 +1,7 @@
 // Copyright 2025 Simon Peter Rothgang
 // SPDX-License-Identifier: Apache-2.0
 
-use super::super::{
-    App, BlockCache, ChatMessage, IncrementalMarkdown, MessageBlock, MessageRole, TextBlock,
-    TextBlockSpacing,
-};
+use super::super::{App, ChatMessage, MessageBlock, MessageRole, TextBlock};
 use crate::agent::model;
 
 pub(super) fn reset_for_new_session(
@@ -42,6 +39,7 @@ fn reset_session_identity_state(
     app.login_hint = None;
     super::clear_compaction_state(app, false);
     app.session_usage = super::super::SessionUsageState::default();
+    app.status = super::super::AppStatus::Ready;
     app.fast_mode_state = model::FastModeState::Off;
     app.runtime_session_state = None;
     app.prompt_suggestion = None;
@@ -65,12 +63,10 @@ fn reset_messages_for_new_session(app: &mut App, preserve_current_welcome_tip: b
     }
     app.push_message_tracked(welcome);
     app.sync_welcome_snapshot();
-    app.viewport = super::super::ChatViewport::new();
 }
 
 fn reset_input_state_for_new_session(app: &mut App) {
     app.input.clear();
-    app.help_open = false;
     app.pending_submit = None;
     app.pending_paste_text.clear();
     app.pending_paste_session = None;
@@ -83,9 +79,6 @@ fn reset_interaction_state_for_new_session(app: &mut App) {
     app.clear_tool_scope_tracking();
     app.tool_call_index.clear();
     app.todos.clear();
-    app.show_todo_panel = false;
-    app.todo_scroll = 0;
-    app.todo_selected = 0;
     app.focus = super::super::FocusManager::default();
     app.available_commands.clear();
     app.available_agents.clear();
@@ -94,29 +87,19 @@ fn reset_interaction_state_for_new_session(app: &mut App) {
 }
 
 fn reset_render_state_for_new_session(app: &mut App) {
-    app.selection = None;
-    app.scrollbar_drag = None;
-    app.rendered_chat_lines.clear();
-    app.rendered_chat_area = ratatui::layout::Rect::default();
-    app.rendered_input_lines.clear();
-    app.rendered_input_area = ratatui::layout::Rect::default();
+    app.chat_render.reset();
     app.mention = None;
     crate::app::file_index::reset(app);
     app.slash = None;
     app.subagent = None;
-    app.help_view = super::super::HelpView::default();
-    app.help_dialog = crate::app::dialog::DialogState::default();
-    app.help_visible_count = 0;
 }
 
 fn reset_cache_and_footer_state_for_new_session(app: &mut App) {
-    app.cached_todo_compact = None;
     app.clear_terminal_tool_call_tracking();
     app.mcp = super::super::McpState::default();
     crate::app::usage::reset_for_session_change(app);
     crate::app::plugins::reset_for_session_change(app);
-    app.force_redraw = true;
-    app.needs_redraw = true;
+    app.request_chat_visible_rebuild();
 }
 
 fn append_resume_user_message_chunk(app: &mut App, chunk: &model::ContentChunk) {
@@ -135,35 +118,22 @@ fn append_resume_user_message_chunk(app: &mut App, chunk: &model::ContentChunk) 
             block.markdown.append(&text.text);
             block.cache.invalidate();
         } else {
-            let mut incr = IncrementalMarkdown::default();
-            incr.append(&text.text);
-            last.blocks.push(MessageBlock::Text(TextBlock {
-                text: text.text.clone(),
-                cache: BlockCache::default(),
-                markdown: incr,
-                trailing_spacing: TextBlockSpacing::default(),
-            }));
+            last.blocks.push(MessageBlock::Text(TextBlock::from_complete(&text.text)));
         }
         let last_idx = app.messages.len().saturating_sub(1);
         app.sync_after_message_blocks_changed(last_idx);
         return;
     }
 
-    let mut incr = IncrementalMarkdown::default();
-    incr.append(&text.text);
     app.push_message_tracked(ChatMessage::new(
         MessageRole::User,
-        vec![MessageBlock::Text(TextBlock {
-            text: text.text.clone(),
-            cache: BlockCache::default(),
-            markdown: incr,
-            trailing_spacing: TextBlockSpacing::default(),
-        })],
+        vec![MessageBlock::Text(TextBlock::from_complete(&text.text))],
         None,
     ));
 }
 
 pub(super) fn load_resume_history(app: &mut App, history_updates: &[model::SessionUpdate]) {
+    app.show_session_overview = false;
     let preserved_tip_seed = app.current_welcome_tip_seed();
     app.clear_messages_tracked();
     app.history_retention_stats = super::super::state::HistoryRetentionStats::default();
@@ -184,7 +154,42 @@ pub(super) fn load_resume_history(app: &mut App, history_updates: &[model::Sessi
     }
     app.finalize_turn_runtime_artifacts(model::ToolCallStatus::Failed);
     app.clear_active_turn_assistant();
+    super::clear_compaction_state(app, false);
+    app.status = super::super::AppStatus::Ready;
+    app.cancelled_turn_pending_hint = false;
+    app.pending_cancel_origin = None;
+    app.pending_auto_submit_after_cancel = false;
     app.enforce_history_retention_tracked();
-    app.viewport = super::super::ChatViewport::new();
-    app.viewport.engage_auto_scroll();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reset_for_new_session;
+    use crate::agent::model;
+    use crate::app::{App, ChatMessage};
+
+    #[test]
+    fn session_reset_clears_chat_render_measurement_state() {
+        let mut app = App::test_default();
+        app.chat_render.terminal_width = 120;
+        app.chat_render.terminal_height = 40;
+        app.chat_render.composer.total_rows = 6;
+        app.chat_render.live_region.anchor_valid = true;
+        app.chat_render.live_region.last_rendered_rows = 9;
+        app.messages.push(ChatMessage::welcome("1.2.3", "Pro", "/workspace/demo", "session-1"));
+
+        reset_for_new_session(
+            &mut app,
+            model::SessionId::new("session-2"),
+            model::CurrentModel::new("test", "test", "test").authoritative(true),
+            None,
+            false,
+        );
+
+        assert_eq!(app.chat_render.terminal_width, 0);
+        assert_eq!(app.chat_render.terminal_height, 0);
+        assert_eq!(app.chat_render.composer.total_rows, 0);
+        assert!(!app.chat_render.live_region.anchor_valid);
+        assert_eq!(app.chat_render.live_region.last_rendered_rows, 0);
+    }
 }

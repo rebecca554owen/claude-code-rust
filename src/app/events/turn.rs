@@ -79,13 +79,12 @@ pub(super) fn handle_permission_request_event(
             selected_index: 0,
             focused: auto_focus,
         });
-        tc.mark_tool_call_layout_dirty();
+        tc.invalidate_render_cache();
         layout_dirty = true;
         app.pending_interaction_ids.push(tool_id.clone());
         if auto_focus {
             app.claim_focus_target(FocusTarget::Permission);
         }
-        app.viewport.engage_auto_scroll();
         app.notifications.notify(
             app.config.preferred_notification_channel_effective(),
             super::super::notify::NotifyEvent::PermissionRequired,
@@ -117,6 +116,7 @@ pub(super) fn handle_permission_request_event(
         app.sync_render_cache_slot(mi, bi);
         app.recompute_message_retained_bytes(mi);
         app.invalidate_layout(InvalidationLevel::MessageChanged(mi));
+        app.request_chat_mutable_rebuild();
     }
 }
 
@@ -179,13 +179,12 @@ pub(super) fn handle_question_request_event(
             question_index: request.question_index,
             total_questions: request.total_questions,
         });
-        tc.mark_tool_call_layout_dirty();
+        tc.invalidate_render_cache();
         layout_dirty = true;
         app.pending_interaction_ids.push(tool_id.clone());
         if auto_focus {
             app.claim_focus_target(FocusTarget::Permission);
         }
-        app.viewport.engage_auto_scroll();
         app.notifications.notify(
             app.config.preferred_notification_channel_effective(),
             super::super::notify::NotifyEvent::QuestionRequired,
@@ -220,6 +219,7 @@ pub(super) fn handle_question_request_event(
         app.sync_render_cache_slot(mi, bi);
         app.recompute_message_retained_bytes(mi);
         app.invalidate_layout(InvalidationLevel::MessageChanged(mi));
+        app.request_chat_mutable_rebuild();
     }
 }
 
@@ -301,6 +301,7 @@ pub(super) fn handle_turn_complete_event(
         model::ToolCallStatus::Completed
     };
     finish_ready_turn_exit(app, exit, tool_status);
+    request_post_turn_resize_purge_replay_if_needed(app);
     crate::app::session_runtime::request_context_usage_refresh(app);
     if turn_was_active {
         app.notifications.notify(
@@ -308,7 +309,7 @@ pub(super) fn handle_turn_complete_event(
             super::super::notify::NotifyEvent::TurnComplete,
         );
     }
-    if app.active_view == super::super::ActiveView::Chat {
+    if app.surface_mode == super::super::SurfaceMode::Chat {
         super::super::input_submit::maybe_auto_submit_after_cancel(app);
     }
 }
@@ -333,8 +334,9 @@ pub(super) fn handle_turn_error_event(
         );
         app.pending_submit = None;
         finish_ready_turn_exit(app, exit, model::ToolCallStatus::Failed);
+        request_post_turn_resize_purge_replay_if_needed(app);
         crate::app::session_runtime::request_context_usage_refresh(app);
-        if app.active_view == super::super::ActiveView::Chat {
+        if app.surface_mode == super::super::SurfaceMode::Chat {
             super::super::input_submit::maybe_auto_submit_after_cancel(app);
         }
         return;
@@ -405,7 +407,20 @@ pub(super) fn handle_turn_error_event(
     }
     app.clear_active_turn_assistant();
     super::notices::clear_turn_notice_tracking(app);
+    request_post_turn_resize_purge_replay_if_needed(app);
     crate::app::session_runtime::request_context_usage_refresh(app);
+}
+
+fn request_post_turn_resize_purge_replay_if_needed(app: &mut App) {
+    if !app.chat_render.take_resize_purge_replay_after_turn() {
+        return;
+    }
+    if matches!(
+        app.terminal_lifecycle,
+        super::super::TerminalLifecycleState::Running(super::super::SurfaceMode::Chat)
+    ) {
+        app.request_chat_resize_purge_replay_rebuild();
+    }
 }
 
 fn push_interrupted_hint(app: &mut App) {
@@ -415,7 +430,6 @@ fn push_interrupted_hint(app: &mut App) {
         None,
     ));
     app.enforce_history_retention_tracked();
-    app.viewport.engage_auto_scroll();
 }
 
 fn remove_empty_tail_assistant(app: &mut App, idx: Option<usize>) -> Option<usize> {
@@ -496,7 +510,7 @@ fn push_turn_error_message(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::App;
+    use crate::app::{App, ChatRebuildKind, SurfaceMode, TerminalLifecycleState};
 
     fn empty_assistant_message() -> ChatMessage {
         ChatMessage::new(MessageRole::Assistant, Vec::new(), None)
@@ -550,5 +564,101 @@ mod tests {
         assert_eq!(app.messages.len(), 2);
         assert!(matches!(app.messages[0].role, MessageRole::User));
         assert!(matches!(app.messages[1].role, MessageRole::System(None)));
+    }
+
+    #[test]
+    fn turn_complete_keeps_canonical_assistant_and_clears_active_owner() {
+        let mut app = App::test_default();
+        app.status = AppStatus::Thinking;
+        app.messages.push(user_message("hello"));
+        app.messages.push(ChatMessage::new(
+            MessageRole::Assistant,
+            vec![MessageBlock::Text(TextBlock::from_complete("done"))],
+            None,
+        ));
+        app.bind_active_turn_assistant(1);
+
+        handle_turn_complete_event(&mut app, None);
+
+        assert_eq!(app.status, AppStatus::Ready);
+        assert_eq!(app.active_turn_assistant_idx(), None);
+        assert_eq!(app.messages.len(), 2);
+        let Some(MessageBlock::Text(text)) = app.messages[1].blocks.first() else {
+            panic!("expected assistant text block");
+        };
+        assert_eq!(text.text, "done");
+    }
+
+    #[test]
+    fn turn_complete_runs_final_resize_purge_replay_after_stream_time_resize() {
+        let mut app = App::test_default();
+        app.surface_dirty = crate::app::SurfaceDirtyState::default();
+        app.terminal_lifecycle = TerminalLifecycleState::Running(SurfaceMode::Chat);
+        app.status = AppStatus::Running;
+        app.messages.push(user_message("hello"));
+        app.messages.push(ChatMessage::new(
+            MessageRole::Assistant,
+            vec![MessageBlock::Text(TextBlock::from_complete("streamed"))],
+            None,
+        ));
+        app.bind_active_turn_assistant(1);
+        app.chat_render.mark_resize_purge_replay_during_turn();
+
+        handle_turn_complete_event(&mut app, None);
+
+        assert_eq!(app.surface_dirty.chat.rebuild, ChatRebuildKind::ResizePurgeReplay);
+        assert!(app.surface_dirty.chat.repaint);
+        assert!(!app.chat_render.resize_purge_replay_after_turn);
+    }
+
+    #[test]
+    fn permission_request_marks_canonical_tool_pending_permission() {
+        let mut app = App::test_default();
+        let tool_id = "bash-1";
+        app.messages.push(ChatMessage::new(
+            MessageRole::Assistant,
+            vec![MessageBlock::ToolCall(Box::new(crate::app::ToolCallInfo {
+                id: tool_id.to_owned(),
+                title: "tool".to_owned(),
+                sdk_tool_name: "Bash".to_owned(),
+                raw_input: None,
+                raw_input_bytes: 0,
+                output_metadata: None,
+                task_metadata: None,
+                status: model::ToolCallStatus::InProgress,
+                content: Vec::new(),
+                hidden: false,
+                terminal_id: None,
+                terminal_command: None,
+                terminal_output: None,
+                terminal_output_len: 0,
+                terminal_bytes_seen: 0,
+                terminal_snapshot_mode: crate::app::TerminalSnapshotMode::AppendOnly,
+                cache: crate::app::BlockCache::default(),
+                pending_permission: None,
+                pending_question: None,
+            }))],
+            None,
+        ));
+        app.bind_active_turn_assistant(0);
+        app.index_tool_call(tool_id.to_owned(), 0, 0);
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let request = model::RequestPermissionRequest::new(
+            "session-1",
+            model::ToolCallUpdate::new(tool_id, model::ToolCallUpdateFields::new()),
+            vec![model::PermissionOption::new(
+                "allow",
+                "Allow",
+                model::PermissionOptionKind::AllowOnce,
+            )],
+            None,
+        );
+
+        handle_permission_request_event(&mut app, request, tx);
+
+        let Some(MessageBlock::ToolCall(tool)) = app.messages[0].blocks.first() else {
+            panic!("expected tool call block");
+        };
+        assert!(tool.pending_permission.is_some());
     }
 }

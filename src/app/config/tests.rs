@@ -81,7 +81,7 @@ fn open_loads_document_and_switches_view() {
 
     open(&mut app).expect("open");
 
-    assert_eq!(app.active_view, ActiveView::Config);
+    assert_eq!(app.surface_mode, SurfaceMode::Fullscreen(FullscreenView::Config));
     assert!(matches!(
         resolve_setting_document(&app.config.committed_settings_document, SettingId::FastMode, &[])
             .value,
@@ -102,7 +102,7 @@ fn open_does_not_force_stop_active_turn() {
 
     open(&mut app).expect("open");
 
-    assert_eq!(app.active_view, ActiveView::Config);
+    assert_eq!(app.surface_mode, SurfaceMode::Fullscreen(FullscreenView::Config));
     assert!(matches!(app.status, AppStatus::Running));
     assert!(app.pending_cancel_origin.is_none());
 }
@@ -216,7 +216,7 @@ fn space_persists_setting_toggles_to_the_expected_document() {
 #[test]
 fn handle_key_moves_between_config_rows() {
     let mut app = App::test_default();
-    app.active_view = ActiveView::Config;
+    app.surface_mode = SurfaceMode::Fullscreen(FullscreenView::Config);
     let last_index = setting_specs().len().saturating_sub(1);
 
     handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
@@ -240,7 +240,7 @@ fn open_rejects_untrusted_projects() {
     let err = open(&mut app).expect_err("open should be blocked");
 
     assert!(err.contains("Project trust"));
-    assert_eq!(app.active_view, ActiveView::Chat);
+    assert_eq!(app.surface_mode, SurfaceMode::Chat);
 }
 
 #[test]
@@ -250,7 +250,7 @@ fn tab_navigation_wraps_and_clears_status_message() {
 
     handle_key(&mut app, KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
 
-    assert_eq!(app.config.active_tab, ConfigTab::Mcp);
+    assert_eq!(app.config.active_tab, ConfigTab::Help);
     assert!(app.config.status_message.is_none());
 
     handle_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
@@ -260,6 +260,22 @@ fn tab_navigation_wraps_and_clears_status_message() {
     handle_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
 
     assert_eq!(app.config.active_tab, ConfigTab::Mcp);
+}
+
+#[test]
+fn help_tab_left_right_switches_help_sections() {
+    let (_dir, mut app) = open_settings_test_app();
+    app.config.active_tab = ConfigTab::Help;
+    app.config.help_section = ConfigHelpSection::Shortcuts;
+
+    handle_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+    assert_eq!(app.config.help_section, ConfigHelpSection::Commands);
+
+    handle_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+    assert_eq!(app.config.help_section, ConfigHelpSection::Subagents);
+
+    handle_key(&mut app, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+    assert_eq!(app.config.help_section, ConfigHelpSection::Commands);
 }
 
 #[test]
@@ -730,7 +746,7 @@ fn overlay_enter_confirms_without_closing_config_screen() {
     handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
     handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
-    assert_eq!(app.active_view, ActiveView::Config);
+    assert_eq!(app.surface_mode, SurfaceMode::Fullscreen(FullscreenView::Config));
     assert!(app.config.overlay.is_none());
     assert_eq!(
         store::output_style(&app.config.committed_local_settings_document),
@@ -1245,7 +1261,7 @@ fn enter_closes_settings_without_editing_selected_row() {
 
     handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
-    assert_eq!(app.active_view, ActiveView::Chat);
+    assert_eq!(app.surface_mode, SurfaceMode::Chat);
     assert!(!app.config.fast_mode_effective());
 }
 
@@ -1270,7 +1286,7 @@ fn mcp_enter_opens_details_overlay_instead_of_closing_config() {
 
     handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
-    assert_eq!(app.active_view, ActiveView::Config);
+    assert_eq!(app.surface_mode, SurfaceMode::Fullscreen(FullscreenView::Config));
     assert_eq!(
         app.config.mcp_details_overlay().map(|overlay| overlay.server_name.as_str()),
         Some("filesystem")
@@ -1289,7 +1305,7 @@ fn mcp_details_overlay_enter_closes_overlay() {
     handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
     assert!(app.config.overlay.is_none());
-    assert_eq!(app.active_view, ActiveView::Config);
+    assert_eq!(app.surface_mode, SurfaceMode::Fullscreen(FullscreenView::Config));
 }
 
 #[test]
@@ -1418,7 +1434,7 @@ fn esc_closes_settings_without_editing_selected_row() {
 
     handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
-    assert_eq!(app.active_view, ActiveView::Chat);
+    assert_eq!(app.surface_mode, SurfaceMode::Chat);
     assert!(!app.config.fast_mode_effective());
 }
 
@@ -1435,7 +1451,7 @@ fn save_failure_keeps_previous_value_and_surfaces_error() {
 
     handle_key(&mut app, KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
 
-    assert_eq!(app.active_view, ActiveView::Config);
+    assert_eq!(app.surface_mode, SurfaceMode::Fullscreen(FullscreenView::Config));
     assert!(!app.config.fast_mode_effective());
     assert!(app.config.last_error.is_some());
     assert!(app.config.status_message.is_none());

@@ -4,18 +4,19 @@
 //! Slash command executors: dispatching parsed commands to their handler functions.
 
 use super::{
-    parse, push_system_message, push_user_message, require_active_session, require_connection,
-    set_command_pending,
+    AppSlashCommand, parse, push_system_message, push_user_message, require_active_session,
+    require_connection, set_command_pending,
 };
 use crate::agent::events::ClientEvent;
 use crate::app::config::{self, SettingFile, store};
 use crate::app::connect::{SessionStartReason, begin_resume_session, start_new_session};
 use crate::app::events::push_system_message_with_severity;
-use crate::app::{App, AppStatus, CancelOrigin, SystemSeverity};
+use crate::app::{App, AppStatus, CancelOrigin, ReleaseReason, SystemSeverity};
 use std::fmt::Write as _;
+use std::path::Path;
+use std::process::{ExitStatus, Stdio};
+use tokio::sync::mpsc;
 
-const ONE_M_CONTEXT_USAGE: &str = "Usage: /1m-context <enable|disable|status>";
-const OPUS_VERSION_USAGE: &str = "Usage: /opus-version <4.5|4.6|4.7|default|status>";
 const OPUS_4_5_MODEL_ID: &str = "claude-opus-4-5-20251101";
 const OPUS_4_6_MODEL_ID: &str = "claude-opus-4-6";
 const OPUS_4_7_MODEL_ID: &str = "claude-opus-4-7";
@@ -29,25 +30,33 @@ pub fn try_handle_submit(app: &mut App, text: &str) -> bool {
         return false;
     };
 
-    match parsed.name {
-        "/1m-context" => handle_1m_context_submit(app, &parsed.args),
-        "/cancel" => handle_cancel_submit(app),
-        "/compact" => handle_compact_submit(app, &parsed.args),
-        "/config" => handle_config_submit(app, &parsed.args),
-        "/docs" => handle_docs_submit(app, &parsed.args),
-        "/mcp" => handle_mcp_submit(app, &parsed.args),
-        "/plugins" => handle_plugins_submit(app, &parsed.args),
-        "/opus-version" => handle_opus_version_submit(app, &parsed.args),
-        "/status" => handle_status_submit(app, &parsed.args),
-        "/usage" => handle_usage_submit(app, &parsed.args),
-        "/login" => handle_login_submit(app, &parsed.args),
-        "/logout" => handle_logout_submit(app, &parsed.args),
-        "/mode" => handle_mode_submit(app, &parsed.args),
-        "/model" => handle_model_submit(app, &parsed.args),
-        "/new-session" => handle_new_session_submit(app, &parsed.args),
-        "/resume" => handle_resume_submit(app, &parsed.args),
-        _ => handle_unknown_submit(app, parsed.name),
+    let Some(command) = AppSlashCommand::from_name(parsed.name) else {
+        return handle_unknown_submit(app, parsed.name);
+    };
+
+    match command {
+        AppSlashCommand::OneMContext => handle_1m_context_submit(app, &parsed.args),
+        AppSlashCommand::Cancel => handle_cancel_submit(app),
+        AppSlashCommand::Compact => handle_compact_submit(app, &parsed.args),
+        AppSlashCommand::Config => handle_config_submit(app, &parsed.args),
+        AppSlashCommand::Docs => handle_docs_submit(app, &parsed.args),
+        AppSlashCommand::Help => handle_help_submit(app, &parsed.args),
+        AppSlashCommand::Mcp => handle_mcp_submit(app, &parsed.args),
+        AppSlashCommand::Plugins => handle_plugins_submit(app, &parsed.args),
+        AppSlashCommand::OpusVersion => handle_opus_version_submit(app, &parsed.args),
+        AppSlashCommand::Status => handle_status_submit(app, &parsed.args),
+        AppSlashCommand::Usage => handle_usage_submit(app, &parsed.args),
+        AppSlashCommand::Login => handle_login_submit(app, &parsed.args),
+        AppSlashCommand::Logout => handle_logout_submit(app, &parsed.args),
+        AppSlashCommand::Mode => handle_mode_submit(app, &parsed.args),
+        AppSlashCommand::Model => handle_model_submit(app, &parsed.args),
+        AppSlashCommand::NewSession => handle_new_session_submit(app, &parsed.args),
+        AppSlashCommand::Resume => handle_resume_submit(app, &parsed.args),
     }
+}
+
+fn usage(command: AppSlashCommand) -> &'static str {
+    command.usage()
 }
 
 fn opus_model_id_for_version(version: &str) -> Option<&'static str> {
@@ -70,12 +79,12 @@ fn opus_version_label_for_model_id(model_id: &str) -> Option<&'static str> {
 
 fn handle_opus_version_submit(app: &mut App, args: &[&str]) -> bool {
     let [subcommand] = args else {
-        push_system_message(app, OPUS_VERSION_USAGE);
+        push_system_message(app, usage(AppSlashCommand::OpusVersion));
         return true;
     };
     let subcommand = subcommand.trim();
     if subcommand.is_empty() || args.len() != 1 {
-        push_system_message(app, OPUS_VERSION_USAGE);
+        push_system_message(app, usage(AppSlashCommand::OpusVersion));
         return true;
     }
 
@@ -114,7 +123,7 @@ fn handle_opus_version_submit(app: &mut App, args: &[&str]) -> bool {
         }
         _ => {
             let Some(model_id) = opus_model_id_for_version(subcommand) else {
-                push_system_message(app, OPUS_VERSION_USAGE);
+                push_system_message(app, usage(AppSlashCommand::OpusVersion));
                 return true;
             };
             if let Err(err) = set_opus_version_pin(app, Some(model_id)) {
@@ -130,12 +139,12 @@ fn handle_opus_version_submit(app: &mut App, args: &[&str]) -> bool {
 
 fn handle_1m_context_submit(app: &mut App, args: &[&str]) -> bool {
     let [subcommand] = args else {
-        push_system_message(app, ONE_M_CONTEXT_USAGE);
+        push_system_message(app, usage(AppSlashCommand::OneMContext));
         return true;
     };
     let subcommand = subcommand.trim();
     if subcommand.is_empty() || args.len() != 1 {
-        push_system_message(app, ONE_M_CONTEXT_USAGE);
+        push_system_message(app, usage(AppSlashCommand::OneMContext));
         return true;
     }
 
@@ -171,7 +180,7 @@ fn handle_1m_context_submit(app: &mut App, args: &[&str]) -> bool {
             true
         }
         _ => {
-            push_system_message(app, ONE_M_CONTEXT_USAGE);
+            push_system_message(app, usage(AppSlashCommand::OneMContext));
             true
         }
     }
@@ -297,7 +306,7 @@ fn handle_cancel_submit(app: &mut App) -> bool {
 
 fn handle_compact_submit(app: &mut App, args: &[&str]) -> bool {
     if !args.is_empty() {
-        push_system_message(app, "Usage: /compact");
+        push_system_message(app, usage(AppSlashCommand::Compact));
         return true;
     }
     if require_active_session(
@@ -316,13 +325,27 @@ fn handle_compact_submit(app: &mut App, args: &[&str]) -> bool {
 
 fn handle_config_submit(app: &mut App, args: &[&str]) -> bool {
     if !args.is_empty() {
-        push_system_message(app, "Usage: /config");
+        push_system_message(app, usage(AppSlashCommand::Config));
         return true;
     }
 
     if let Err(err) = crate::app::config::open(app) {
         push_system_message(app, format!("Failed to open settings: {err}"));
     }
+    true
+}
+
+fn handle_help_submit(app: &mut App, args: &[&str]) -> bool {
+    if !args.is_empty() {
+        push_system_message(app, usage(AppSlashCommand::Help));
+        return true;
+    }
+
+    if let Err(err) = crate::app::config::open(app) {
+        push_system_message(app, format!("Failed to open help: {err}"));
+        return true;
+    }
+    crate::app::config::activate_tab(app, crate::app::ConfigTab::Help);
     true
 }
 
@@ -364,7 +387,7 @@ fn handle_plugins_submit(app: &mut App, args: &[&str]) -> bool {
 
 fn handle_mcp_submit(app: &mut App, args: &[&str]) -> bool {
     if !args.is_empty() {
-        push_system_message(app, "Usage: /mcp");
+        push_system_message(app, usage(AppSlashCommand::Mcp));
         return true;
     }
 
@@ -378,7 +401,7 @@ fn handle_mcp_submit(app: &mut App, args: &[&str]) -> bool {
 
 fn handle_status_submit(app: &mut App, args: &[&str]) -> bool {
     if !args.is_empty() {
-        push_system_message(app, "Usage: /status");
+        push_system_message(app, usage(AppSlashCommand::Status));
         return true;
     }
 
@@ -392,7 +415,7 @@ fn handle_status_submit(app: &mut App, args: &[&str]) -> bool {
 
 fn handle_usage_submit(app: &mut App, args: &[&str]) -> bool {
     if !args.is_empty() {
-        push_system_message(app, "Usage: /usage");
+        push_system_message(app, usage(AppSlashCommand::Usage));
         return true;
     }
 
@@ -406,7 +429,7 @@ fn handle_usage_submit(app: &mut App, args: &[&str]) -> bool {
 
 fn handle_login_submit(app: &mut App, args: &[&str]) -> bool {
     if !args.is_empty() {
-        push_system_message(app, "Usage: /login");
+        push_system_message(app, usage(AppSlashCommand::Login));
         return true;
     }
 
@@ -443,19 +466,7 @@ fn handle_login_submit(app: &mut App, args: &[&str]) -> bool {
             outcome = "start",
             auth_command = "login",
         );
-        crate::app::suspend_terminal();
-
-        let result = tokio::process::Command::new(&claude_path)
-            .args(["auth", "login"])
-            .stdin(std::process::Stdio::inherit())
-            .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::inherit())
-            .status()
-            .await;
-
-        crate::app::resume_terminal();
-
-        match result {
+        match run_auth_child_command(&tx, &claude_path, "login").await {
             Ok(status) => {
                 tracing::debug!(
                     target: crate::logging::targets::APP_AUTH,
@@ -490,10 +501,8 @@ fn handle_login_submit(app: &mut App, args: &[&str]) -> bool {
                     )));
                 }
             }
-            Err(e) => {
-                let _ = tx.send(ClientEvent::SlashCommandError(format!(
-                    "Failed to run claude auth login: {e}"
-                )));
+            Err(message) => {
+                let _ = tx.send(ClientEvent::SlashCommandError(message));
             }
         }
     });
@@ -502,7 +511,7 @@ fn handle_login_submit(app: &mut App, args: &[&str]) -> bool {
 
 fn handle_logout_submit(app: &mut App, args: &[&str]) -> bool {
     if !args.is_empty() {
-        push_system_message(app, "Usage: /logout");
+        push_system_message(app, usage(AppSlashCommand::Logout));
         return true;
     }
 
@@ -538,19 +547,7 @@ fn handle_logout_submit(app: &mut App, args: &[&str]) -> bool {
             outcome = "start",
             auth_command = "logout",
         );
-        crate::app::suspend_terminal();
-
-        let result = tokio::process::Command::new(&claude_path)
-            .args(["auth", "logout"])
-            .stdin(std::process::Stdio::inherit())
-            .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::inherit())
-            .status()
-            .await;
-
-        crate::app::resume_terminal();
-
-        match result {
+        match run_auth_child_command(&tx, &claude_path, "logout").await {
             Ok(status) => {
                 tracing::debug!(
                     target: crate::logging::targets::APP_AUTH,
@@ -578,14 +575,49 @@ fn handle_logout_submit(app: &mut App, args: &[&str]) -> bool {
                     )));
                 }
             }
-            Err(e) => {
-                let _ = tx.send(ClientEvent::SlashCommandError(format!(
-                    "Failed to run claude auth logout: {e}"
-                )));
+            Err(message) => {
+                let _ = tx.send(ClientEvent::SlashCommandError(message));
             }
         }
     });
     true
+}
+
+async fn run_auth_child_command(
+    tx: &mpsc::UnboundedSender<ClientEvent>,
+    claude_path: &Path,
+    subcommand: &'static str,
+) -> Result<ExitStatus, String> {
+    let _ = tx.send(ClientEvent::TerminalReleasedToChild { reason: ReleaseReason::AuthFlow });
+    let terminal_release = crate::app::terminal_runtime::TerminalReleaseGuard::release(
+        ReleaseReason::AuthFlow,
+        subcommand,
+    )
+    .map_err(|err| {
+        send_terminal_returned_from_child(tx);
+        format!("Failed to release terminal for claude auth {subcommand}: {err}")
+    })?;
+
+    let result = tokio::process::Command::new(claude_path)
+        .args(["auth", subcommand])
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .await
+        .map_err(|err| format!("Failed to run claude auth {subcommand}: {err}"));
+
+    let restore_result = terminal_release.restore();
+    send_terminal_returned_from_child(tx);
+    restore_result.map_err(|err| {
+        format!("Failed to restore terminal after claude auth {subcommand}: {err}")
+    })?;
+
+    result
+}
+
+fn send_terminal_returned_from_child(tx: &mpsc::UnboundedSender<ClientEvent>) {
+    let _ = tx.send(ClientEvent::TerminalReturnedFromChild { reason: ReleaseReason::AuthFlow });
 }
 
 /// Resolve the `claude` CLI binary from PATH, or push an error message and return `None`.
@@ -614,12 +646,12 @@ fn resolve_claude_cli(app: &mut App, subcommand: &str) -> Option<std::path::Path
 
 fn handle_mode_submit(app: &mut App, args: &[&str]) -> bool {
     let [requested_mode_arg] = args else {
-        push_system_message(app, "Usage: /mode <id>");
+        push_system_message(app, usage(AppSlashCommand::Mode));
         return true;
     };
     let requested_mode = requested_mode_arg.trim();
     if requested_mode.is_empty() {
-        push_system_message(app, "Usage: /mode <id>");
+        push_system_message(app, usage(AppSlashCommand::Mode));
         return true;
     }
 
@@ -656,12 +688,12 @@ fn handle_mode_submit(app: &mut App, args: &[&str]) -> bool {
 
 fn handle_model_submit(app: &mut App, args: &[&str]) -> bool {
     let [model_name_arg] = args else {
-        push_system_message(app, "Usage: /model <id>");
+        push_system_message(app, usage(AppSlashCommand::Model));
         return true;
     };
     let model_name = model_name_arg.trim();
     if model_name.is_empty() {
-        push_system_message(app, "Usage: /model <id>");
+        push_system_message(app, usage(AppSlashCommand::Model));
         return true;
     }
 
@@ -702,7 +734,7 @@ fn handle_model_submit(app: &mut App, args: &[&str]) -> bool {
 
 fn handle_new_session_submit(app: &mut App, args: &[&str]) -> bool {
     if !args.is_empty() {
-        push_system_message(app, "Usage: /new-session");
+        push_system_message(app, usage(AppSlashCommand::NewSession));
         return true;
     }
 
@@ -725,12 +757,12 @@ fn handle_new_session_submit(app: &mut App, args: &[&str]) -> bool {
 
 fn handle_resume_submit(app: &mut App, args: &[&str]) -> bool {
     let [session_id_arg] = args else {
-        push_system_message(app, "Usage: /resume <session_id>");
+        push_system_message(app, usage(AppSlashCommand::Resume));
         return true;
     };
     let session_id = session_id_arg.trim();
     if session_id.is_empty() {
-        push_system_message(app, "Usage: /resume <session_id>");
+        push_system_message(app, usage(AppSlashCommand::Resume));
         return true;
     }
 
@@ -758,7 +790,7 @@ fn handle_unknown_submit(app: &mut App, command_name: &str) -> bool {
 }
 
 fn docs_usage() -> &'static str {
-    "Usage: /docs <mode|models|shortcuts|commands|agents>"
+    usage(AppSlashCommand::Docs)
 }
 
 fn build_docs_mode_markdown(app: &App) -> String {

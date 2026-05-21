@@ -107,7 +107,7 @@ pub(super) fn update_terminal_outputs(app: &mut App) -> bool {
         };
         let (update_mode, delta_bytes, total_bytes) = payload.summary();
         if apply_terminal_payload(tc, payload) {
-            tc.mark_tool_call_layout_dirty();
+            tc.invalidate_render_cache();
             tracing::debug!(
                 target: crate::logging::targets::APP_COMMAND,
                 event_name = "terminal_output_summary",
@@ -150,8 +150,7 @@ mod tests {
     use crate::agent::events::TerminalProcess;
     use crate::agent::model;
     use crate::app::{
-        App, BlockCache, ChatMessage, MessageBlock, MessageRole, TerminalSnapshotMode, TextBlock,
-        ToolCallInfo,
+        App, BlockCache, ChatMessage, MessageBlock, MessageRole, TerminalSnapshotMode, ToolCallInfo,
     };
     use std::sync::{Arc, Mutex};
 
@@ -175,12 +174,6 @@ mod tests {
                 terminal_output_len: 0,
                 terminal_bytes_seen: 0,
                 terminal_snapshot_mode: TerminalSnapshotMode::AppendOnly,
-                render_epoch: 0,
-                layout_epoch: 0,
-                last_measured_width: 0,
-                last_measured_height: 0,
-                last_measured_layout_epoch: 0,
-                last_measured_layout_generation: 0,
                 cache: BlockCache::default(),
                 pending_permission: None,
                 pending_question: None,
@@ -189,24 +182,13 @@ mod tests {
         )
     }
 
-    fn user_message(text: &str) -> ChatMessage {
-        ChatMessage::new(
-            MessageRole::User,
-            vec![MessageBlock::Text(TextBlock::from_complete(text))],
-            None,
-        )
-    }
-
     #[test]
-    fn terminal_updates_invalidate_all_dirty_messages() {
+    fn terminal_output_poll_updates_canonical_tool_output() {
         let mut app = App::test_default();
         app.messages.push(bash_tool_message("bash-1", "term-1"));
-        app.messages.push(user_message("gap"));
-        app.messages.push(bash_tool_message("bash-2", "term-2"));
+        app.bind_active_turn_assistant(0);
         app.index_tool_call("bash-1".to_owned(), 0, 0);
-        app.index_tool_call("bash-2".to_owned(), 2, 0);
         app.sync_terminal_tool_call("term-1".to_owned(), 0, 0);
-        app.sync_terminal_tool_call("term-2".to_owned(), 2, 0);
         app.terminals.borrow_mut().insert(
             "term-1".to_owned(),
             TerminalProcess {
@@ -215,24 +197,14 @@ mod tests {
                 command: "echo alpha".to_owned(),
             },
         );
-        app.terminals.borrow_mut().insert(
-            "term-2".to_owned(),
-            TerminalProcess {
-                child: None,
-                output_buffer: Arc::new(Mutex::new(b"beta\n".to_vec())),
-                command: "echo beta".to_owned(),
-            },
-        );
-
-        let _ = app.viewport.on_frame(80, 24);
-        app.viewport.sync_message_count(3);
-        app.viewport.mark_heights_valid();
-        app.viewport.rebuild_prefix_sums();
 
         assert!(update_terminal_outputs(&mut app));
-        assert!(!app.viewport.message_height_is_current(0));
-        assert!(app.viewport.message_height_is_current(1));
-        assert!(!app.viewport.message_height_is_current(2));
-        assert_eq!(app.viewport.oldest_stale_index(), Some(0));
+
+        let Some(MessageBlock::ToolCall(tool)) = app.messages[0].blocks.first() else {
+            panic!("expected tool call block");
+        };
+        assert_eq!(tool.terminal_output.as_deref(), Some("alpha\n"));
+        assert_eq!(tool.terminal_output_len, "alpha\n".len());
+        assert_eq!(tool.terminal_bytes_seen, "alpha\n".len());
     }
 }

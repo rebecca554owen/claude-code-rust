@@ -93,7 +93,7 @@ fn move_permission_option_left(app: &mut App) {
         let next = permission.selected_index.saturating_sub(1);
         if next != permission.selected_index {
             permission.selected_index = next;
-            tc.mark_tool_call_layout_dirty();
+            tc.invalidate_render_cache();
             changed = true;
         }
     }
@@ -108,7 +108,7 @@ fn move_permission_option_right(app: &mut App, option_count: usize) {
         && permission.selected_index + 1 < option_count
     {
         permission.selected_index += 1;
-        tc.mark_tool_call_layout_dirty();
+        tc.invalidate_render_cache();
         changed = true;
     }
     invalidate_if_changed(app, dirty_idx, changed);
@@ -287,13 +287,14 @@ fn respond_permission(app: &mut App, override_index: Option<usize>) {
                 option_count = pending.options.len(),
             );
         }
-        tc.mark_tool_call_layout_dirty();
+        tc.invalidate_render_cache();
         invalidated = true;
     }
     if invalidated {
         app.sync_render_cache_slot(mi, bi);
         app.recompute_message_retained_bytes(mi);
         app.invalidate_layout(InvalidationLevel::MessageChanged(mi));
+        app.request_chat_mutable_rebuild();
     }
 
     focus_next_inline_interaction(app);
@@ -318,10 +319,11 @@ fn respond_permission_cancel(app: &mut App) {
         let _ = pending.response_tx.send(model::RequestPermissionResponse::new(
             model::RequestPermissionOutcome::Cancelled,
         ));
-        tc.mark_tool_call_layout_dirty();
+        tc.invalidate_render_cache();
         app.sync_render_cache_slot(mi, bi);
         app.recompute_message_retained_bytes(mi);
         app.invalidate_layout(InvalidationLevel::MessageChanged(mi));
+        app.request_chat_mutable_rebuild();
     }
 
     focus_next_inline_interaction(app);
@@ -356,12 +358,6 @@ mod tests {
             terminal_output_len: 0,
             terminal_bytes_seen: 0,
             terminal_snapshot_mode: crate::app::TerminalSnapshotMode::AppendOnly,
-            render_epoch: 0,
-            layout_epoch: 0,
-            last_measured_width: 0,
-            last_measured_height: 0,
-            last_measured_layout_epoch: 0,
-            last_measured_layout_generation: 0,
             cache: BlockCache::default(),
             pending_permission: None,
             pending_question: None,
@@ -839,32 +835,6 @@ mod tests {
         let app = App::test_default();
         let _ = IncrementalMarkdown::default();
         assert!(app.messages.is_empty());
-    }
-
-    #[test]
-    fn single_focused_permission_consumes_up_down_without_rotation() {
-        let mut app = App::test_default();
-        let mut rx = add_permission(&mut app, "perm-1", allow_options(), true);
-        app.viewport.scroll_target = 7;
-
-        let consumed_up = crate::app::inline_interactions::handle_interaction_focus_cycle(
-            &mut app,
-            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
-            true,
-            false,
-        );
-        let consumed_down = crate::app::inline_interactions::handle_interaction_focus_cycle(
-            &mut app,
-            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
-            true,
-            false,
-        );
-
-        assert_eq!(consumed_up, Some(true));
-        assert_eq!(consumed_down, Some(true));
-        assert_eq!(app.pending_interaction_ids, vec!["perm-1"]);
-        assert_eq!(app.viewport.scroll_target, 7);
-        assert!(matches!(rx.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
     }
 
     #[test]

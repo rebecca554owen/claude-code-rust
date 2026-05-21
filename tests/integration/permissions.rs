@@ -62,14 +62,6 @@ async fn permission_request_attaches_to_tool_call() {
     }
 }
 
-#[tokio::test]
-async fn permission_request_enables_auto_scroll() {
-    let mut app = test_app();
-    app.viewport.auto_scroll = false;
-    let _rx = setup_permission(&mut app, "tc-scroll", allow_deny_options());
-    assert!(app.viewport.auto_scroll, "permission request should enable auto_scroll");
-}
-
 // --- Permission for unknown tool call auto-rejects ---
 
 #[tokio::test]
@@ -146,40 +138,6 @@ async fn duplicate_permission_request_is_rejected_without_duplicate_queue_entry(
     assert_eq!(selected.option_id.clone(), "deny");
 }
 
-// --- Scroll interaction during streaming ---
-
-#[tokio::test]
-async fn scroll_target_preserved_across_text_chunks() {
-    let mut app = test_app();
-    app.viewport.scroll_target = 42;
-    app.viewport.auto_scroll = false;
-
-    let chunk =
-        model::ContentChunk::new(model::ContentBlock::Text(model::TextContent::new("Some text")));
-    send_client_event(
-        &mut app,
-        ClientEvent::SessionUpdate(model::SessionUpdate::AgentMessageChunk(chunk)),
-    );
-
-    // Text chunks should NOT reset scroll when auto_scroll is off
-    assert_eq!(app.viewport.scroll_target, 42, "scroll_target should be preserved");
-    assert!(!app.viewport.auto_scroll, "auto_scroll should stay off");
-}
-
-#[tokio::test]
-async fn tool_call_does_not_change_scroll_when_auto_scroll_off() {
-    let mut app = test_app();
-    app.viewport.scroll_target = 10;
-    app.viewport.auto_scroll = false;
-
-    let tc =
-        model::ToolCall::new("tc-scroll", "Read file").status(model::ToolCallStatus::InProgress);
-    send_client_event(&mut app, ClientEvent::SessionUpdate(model::SessionUpdate::ToolCall(tc)));
-
-    assert_eq!(app.viewport.scroll_target, 10, "tool calls shouldn't touch scroll_target");
-    assert!(!app.viewport.auto_scroll);
-}
-
 // --- TurnComplete transient state reset ---
 
 #[tokio::test]
@@ -242,12 +200,10 @@ async fn turn_complete_does_not_clear_todos() {
         status: claude_code_rust::app::TodoStatus::InProgress,
         active_form: "Testing".into(),
     }];
-    app.show_todo_panel = true;
 
     send_client_event(&mut app, ClientEvent::TurnComplete { terminal_reason: None });
 
     assert_eq!(app.todos.len(), 1, "todos should persist across turns");
-    assert!(app.show_todo_panel, "todo panel state should persist");
 }
 
 #[tokio::test]

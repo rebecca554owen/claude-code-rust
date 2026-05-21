@@ -14,15 +14,15 @@ mod session_start;
 mod type_converters;
 
 use super::config::ConfigState;
-use super::dialog::DialogState;
 use super::plugins::PluginsState;
 use super::state::{
     CacheMetrics, HistoryRetentionPolicy, HistoryRetentionStats, RenderCacheBudget,
     SessionPickerState,
 };
 use super::trust;
-use super::view::ActiveView;
-use super::{App, AppStatus, ChatViewport, FocusManager, HelpView, SelectionState, TodoItem};
+use super::view::SurfaceMode;
+use super::{App, AppStatus, FocusManager, TodoItem};
+use super::{SurfaceDirtyState, TerminalLifecycleState};
 use crate::agent::client::AgentConnection;
 use crate::agent::events::ClientEvent;
 use crate::agent::model;
@@ -122,7 +122,9 @@ pub fn create_app(cli: &Cli) -> App {
 
     let cwd_display = shorten_cwd(&cwd);
     let mut app = App {
-        active_view: ActiveView::Chat,
+        surface_mode: SurfaceMode::Chat,
+        terminal_lifecycle: TerminalLifecycleState::Bootstrapping,
+        surface_dirty: SurfaceDirtyState::initial_chat(),
         config: ConfigState::default(),
         trust: trust::TrustState::default(),
         settings_home_override: None,
@@ -134,10 +136,13 @@ pub fn create_app(cli: &Cli) -> App {
         )],
         message_retained_bytes: Vec::new(),
         retained_history_bytes: 0,
-        viewport: ChatViewport::new(),
         input: super::InputState::new(),
         status: AppStatus::Connecting,
         resuming_session_id: None,
+        show_session_overview: !matches!(
+            &cli.command,
+            Some(Command::Resume { session_id: Some(_) })
+        ),
         pending_command_label: None,
         pending_command_ack: None,
         should_quit: false,
@@ -153,10 +158,6 @@ pub fn create_app(cli: &Cli) -> App {
         config_options: std::collections::BTreeMap::new(),
         login_hint: None,
         pending_compact_clear: false,
-        help_view: HelpView::Keys,
-        help_open: false,
-        help_dialog: DialogState::default(),
-        help_visible_count: 0,
         pending_interaction_ids: Vec::new(),
         cancelled_turn_pending_hint: false,
         pending_cancel_origin: None,
@@ -168,16 +169,11 @@ pub fn create_app(cli: &Cli) -> App {
         spinner_frame: 0,
         spinner_last_advance_at: None,
         active_turn_assistant_message_idx: None,
-        tools_collapsed: true,
         active_task_ids: HashSet::new(),
         tool_call_scopes: HashMap::new(),
         terminals,
-        force_redraw: false,
         tool_call_index: HashMap::new(),
         todos: Vec::<TodoItem>::new(),
-        show_todo_panel: false,
-        todo_scroll: 0,
-        todo_selected: 0,
         focus: FocusManager::default(),
         available_commands: Vec::new(),
         plugins: PluginsState::default(),
@@ -185,13 +181,7 @@ pub fn create_app(cli: &Cli) -> App {
         available_models: Vec::new(),
         recent_sessions: Vec::new(),
         session_picker: SessionPickerState::default(),
-        cached_frame_area: ratatui::layout::Rect::new(0, 0, 0, 0),
-        selection: Option::<SelectionState>::None,
-        scrollbar_drag: None,
-        rendered_chat_lines: Vec::new(),
-        rendered_chat_area: ratatui::layout::Rect::new(0, 0, 0, 0),
-        rendered_input_lines: Vec::new(),
-        rendered_input_area: ratatui::layout::Rect::new(0, 0, 0, 0),
+        chat_render: super::ChatRenderState::default(),
         mention: None,
         file_index: super::file_index::FileIndexState::default(),
         slash: None,
@@ -203,7 +193,6 @@ pub fn create_app(cli: &Cli) -> App {
         active_paste_session: None,
         next_paste_session_id: 1,
         pending_images: Vec::new(),
-        cached_todo_compact: None,
         git_context: super::git_context::GitContextState::default(),
         update_notice: None,
         session_usage: super::SessionUsageState::default(),
@@ -218,7 +207,6 @@ pub fn create_app(cli: &Cli) -> App {
         account_info: None,
         terminal_tool_calls: Vec::new(),
         terminal_tool_call_membership: HashSet::new(),
-        needs_redraw: true,
         notifications: super::notify::NotificationManager::new(),
         perf,
         render_cache_budget: RenderCacheBudget::default(),
@@ -233,7 +221,6 @@ pub fn create_app(cli: &Cli) -> App {
         fps_ema: None,
         last_frame_at: None,
         last_chat_render_trace_state: None,
-        last_active_turn_height_state: None,
         startup_connection_requested: false,
         connection_started: false,
         startup_bridge_script: cli.bridge_script.clone(),
@@ -328,6 +315,7 @@ mod tests {
     use crate::Cli;
     use crate::agent::model;
     use crate::agent::types;
+    use crate::app::{FullscreenView, SurfaceMode, TerminalLifecycleState};
 
     #[test]
     fn map_session_update_preserves_config_option_update() {
@@ -344,7 +332,7 @@ mod tests {
     }
 
     #[test]
-    fn create_app_prewarms_file_index_for_startup_cwd() {
+    fn create_app_prewarms_file_index_and_routes_untrusted_cwd_to_trust_surface() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cli = Cli {
             command: None,
@@ -366,5 +354,7 @@ mod tests {
         assert_eq!(app.file_index.root.as_deref(), Some(dir.path()));
         assert!(app.file_index.scan.is_some());
         assert!(app.file_index.watch.is_some());
+        assert_eq!(app.surface_mode, SurfaceMode::Fullscreen(FullscreenView::Trusted));
+        assert_eq!(app.terminal_lifecycle, TerminalLifecycleState::Bootstrapping);
     }
 }

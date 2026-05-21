@@ -15,13 +15,13 @@ mod inline_interactions;
 pub(crate) mod input;
 mod input_submit;
 mod keys;
+mod lifecycle;
 pub(crate) mod mention;
 mod notify;
 pub(crate) mod paste_burst;
 mod permissions;
 pub(crate) mod plugins;
 mod questions;
-mod selection;
 mod service_status_check;
 pub(crate) mod session_picker;
 mod session_runtime;
@@ -30,11 +30,14 @@ mod state;
 pub(crate) mod subagent;
 mod tab_title;
 mod terminal;
-mod todos;
+pub(crate) mod terminal_runtime;
+pub(crate) mod todos;
 mod trust;
 mod update_check;
 pub(crate) mod usage;
 mod view;
+
+pub(crate) const AUTOCOMPLETE_VISIBLE_ROWS: usize = 5;
 
 // Re-export all public types so `crate::app::App`, `crate::app::BlockCache`, etc. still work.
 pub use cache_policy::{
@@ -42,38 +45,37 @@ pub use cache_policy::{
     DEFAULT_TOOL_PREVIEW_LIMIT_BYTES, TextSplitDecision, TextSplitKind, default_cache_split_policy,
     find_text_split, find_text_split_index,
 };
-pub use config::{ConfigState, ConfigTab};
+pub use config::{ConfigHelpSection, ConfigState, ConfigTab};
 pub use connect::{create_app, start_connection};
 pub use events::{handle_client_event, handle_terminal_event};
 pub use focus::{FocusManager, FocusOwner, FocusTarget};
 pub use input::InputState;
-pub(crate) use selection::normalize_selection;
+pub use lifecycle::{
+    ChatRebuildKind, ChatSurfaceDirtyState, FullscreenSurfaceDirtyState, ReleaseReason,
+    SurfaceDirtyState, TerminalLifecycleState,
+};
 pub use service_status_check::start_service_status_check;
 pub(crate) use state::MarkdownRenderKey;
-pub(crate) use state::cache_metrics;
 pub use state::{
-    App, AppStatus, BlockCache, CacheMetrics, CachedMessageSegment, CancelOrigin, ChatMessage,
-    ChatRenderTraceState, ChatViewport, ExtraUsage, HelpView, IncrementalMarkdown,
-    InlinePermission, InlineQuestion, InvalidationLevel, LayoutInvalidation, LoginHint, McpState,
-    MessageBlock, MessageBlockRenderSignature, MessageRenderCache, MessageRenderCacheKey,
-    MessageRenderSignature, MessageRole, MessageUsage, ModeInfo, ModeState, NoticeBlock,
-    NoticeDedupKey, NoticeStage, PasteSessionState, PendingCommandAck, RateLimitIncidentKey,
-    RecentSessionInfo, ScrollbarGeometry, SelectionKind, SelectionPoint, SelectionState,
-    SessionPickerState, SessionUsageState, SystemSeverity, TerminalSnapshotMode, TextBlock,
-    TextBlockSpacing, TodoItem, TodoStatus, ToolCallInfo, ToolCallScope, TurnNoticeLocation,
-    TurnNoticeRef, UpdateNoticeState, UsageSnapshot, UsageSourceKind, UsageSourceMode, UsageState,
-    UsageWindow, WelcomeBlock, compute_scrollbar_geometry, hash_text_block_content,
-    hash_welcome_block_content, is_execute_tool_name,
+    App, AppStatus, BlockCache, CacheMetrics, CancelOrigin, ChatMessage, ChatMessageId,
+    ChatRenderState, ChatRenderTraceState, ComposerRenderState, ExtraUsage, HistoryOutputId,
+    ImageAttachmentBlock, IncrementalMarkdown, InlinePermission, InlineQuestion, InvalidationLevel,
+    LayoutInvalidation, LiveRegionRenderState, LoginHint, McpState, MessageBlock, MessageBlockId,
+    MessageRole, MessageUsage, ModeInfo, ModeState, NoticeBlock, NoticeDedupKey, NoticeStage,
+    PasteSessionState, PendingCommandAck, RateLimitIncidentKey, RecentSessionInfo, SelectionPoint,
+    SessionPickerState, SessionUsageState, SystemSeverity, TerminalSize, TerminalSizeChange,
+    TerminalSnapshotMode, TextBlock, TextBlockSpacing, TodoItem, TodoStatus, ToolCallInfo,
+    ToolCallScope, TurnNoticeLocation, TurnNoticeRef, UpdateNoticeState, UsageSnapshot,
+    UsageSourceKind, UsageSourceMode, UsageState, UsageWindow, WelcomeBlock,
+    hash_text_block_content, hash_welcome_block_content, is_execute_tool_name,
 };
 pub use trust::TrustSelection;
 pub use update_check::start_update_check;
-pub use view::ActiveView;
+pub use view::{FullscreenView, SurfaceMode};
 
+use crate::agent::events::ClientEvent;
 use crate::agent::model;
-use crossterm::event::{
-    EventStream, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
-};
+use crossterm::event::EventStream;
 use futures::{FutureExt as _, StreamExt};
 use std::time::{Duration, Instant};
 
@@ -81,53 +83,30 @@ const SPINNER_FRAME_INTERVAL_NORMAL: Duration = Duration::from_millis(30);
 const SPINNER_FRAME_INTERVAL_REDUCED: Duration = Duration::from_millis(120);
 
 // ---------------------------------------------------------------------------
-// Terminal suspend / resume helpers (reused by /login, /logout)
-// ---------------------------------------------------------------------------
-
-/// Disable raw mode and crossterm features so a child process can own the
-/// terminal (e.g. `claude auth login` which opens a browser flow).
-pub(crate) fn suspend_terminal() {
-    let _ = crossterm::execute!(
-        std::io::stdout(),
-        crossterm::event::DisableBracketedPaste,
-        crossterm::event::DisableMouseCapture,
-        crossterm::event::DisableFocusChange,
-        PopKeyboardEnhancementFlags
-    );
-    let _ = crossterm::terminal::disable_raw_mode();
-}
-
-/// Re-enable raw mode and crossterm features after a child process finishes.
-pub(crate) fn resume_terminal() {
-    let _ = crossterm::terminal::enable_raw_mode();
-    let _ = crossterm::execute!(
-        std::io::stdout(),
-        crossterm::event::EnableBracketedPaste,
-        crossterm::event::EnableMouseCapture,
-        crossterm::event::EnableFocusChange,
-        PushKeyboardEnhancementFlags(
-            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-                | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
-        )
-    );
-}
-
-// ---------------------------------------------------------------------------
 // TUI event loop
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
 pub async fn run_tui(app: &mut App) -> anyhow::Result<()> {
-    let mut terminal = ratatui::init();
-    let mut os_shutdown = Box::pin(wait_for_shutdown_signal());
+    let mut terminal_runtime = terminal_runtime::TerminalRuntime::bootstrap(app)?;
+    let result = run_tui_loop(app, &mut terminal_runtime).await;
 
-    // Enable bracketed paste, mouse capture, and enhanced keyboard protocol
-    resume_terminal();
+    finish_run_tui(app, &mut terminal_runtime);
+
+    result
+}
+
+#[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
+async fn run_tui_loop(
+    app: &mut App,
+    terminal_runtime: &mut terminal_runtime::TerminalRuntime,
+) -> anyhow::Result<()> {
+    let mut os_shutdown = Box::pin(wait_for_shutdown_signal());
 
     let mut events = EventStream::new();
     let tick_duration = Duration::from_millis(16);
     let mut last_render = Instant::now();
+    let mut service_status_check_started = false;
 
     loop {
         start_connection(app);
@@ -139,7 +118,7 @@ pub async fn run_tui(app: &mut App) -> anyhow::Result<()> {
                 events::handle_terminal_event(app, event);
             }
             Some(event) = app.event_rx.recv() => {
-                events::handle_client_event(app, event);
+                handle_runtime_client_event(app, event, &mut service_status_check_started);
             }
             shutdown = &mut os_shutdown => {
                 if let Err(err) = shutdown {
@@ -166,7 +145,7 @@ pub async fn run_tui(app: &mut App) -> anyhow::Result<()> {
             // Then client events
             match app.event_rx.try_recv() {
                 Ok(event) => {
-                    events::handle_client_event(app, event);
+                    handle_runtime_client_event(app, event, &mut service_status_check_started);
                 }
                 Err(_) => break,
             }
@@ -174,11 +153,12 @@ pub async fn run_tui(app: &mut App) -> anyhow::Result<()> {
 
         file_index::drain_events(app);
 
+        let now = Instant::now();
         // Tick the burst detector: flush any held/buffered content that
         // has timed out. EmitChar re-inserts a single held character;
         // EmitPaste feeds the accumulated burst into the paste queue.
-        if app.active_view == ActiveView::Chat
-            && let Some(action) = app.paste_burst.tick(Instant::now())
+        if app.surface_mode == SurfaceMode::Chat
+            && let Some(action) = app.paste_burst.tick(now)
         {
             match action {
                 paste_burst::FlushAction::EmitChar(ch) => {
@@ -191,17 +171,20 @@ pub async fn run_tui(app: &mut App) -> anyhow::Result<()> {
         }
 
         // Merge and process `Event::Paste` chunks as one paste action.
-        if app.active_view == ActiveView::Chat && !app.pending_paste_text.is_empty() {
+        if app.surface_mode == SurfaceMode::Chat && !app.pending_paste_text.is_empty() {
             finalize_pending_paste_event(app);
         }
 
-        app.tick_git_context(Instant::now());
+        app.tick_git_context(now);
+        session_runtime::tick_context_usage_refresh(app, now);
         // Deferred submit: if Enter was pressed and no paste payload arrived
         // in this drain cycle, restore the exact pre-submit snapshot and
         // submit that unchanged draft.
-        if app.active_view == ActiveView::Chat && app.pending_submit.is_some() {
+        if app.surface_mode == SurfaceMode::Chat && app.pending_submit.is_some() {
             finalize_deferred_submit(app);
         }
+
+        terminal_runtime.sync_surface(app)?;
 
         if app.should_quit {
             break;
@@ -218,28 +201,23 @@ pub async fn run_tui(app: &mut App) -> anyhow::Result<()> {
         if is_animating {
             advance_spinner_frame(app, Instant::now());
             tab_title::update_tab_title(&app.status, app.spinner_frame, &app.cwd);
-            app.needs_redraw = true;
+            app.request_active_surface_repaint();
         } else {
             app.spinner_last_advance_at = None;
         }
         // Update tab title on non-animating state transitions (Ready, Error).
-        if !is_animating && app.needs_redraw {
+        if !is_animating && app.surface_dirty.active_surface_needs_draw(app.terminal_lifecycle) {
             tab_title::update_tab_title(&app.status, app.spinner_frame, &app.cwd);
         }
-        // Smooth scroll still settling
-        let scroll_delta = (app.viewport.scroll_target as f32 - app.viewport.scroll_pos).abs();
-        if scroll_delta >= 0.01 {
-            app.needs_redraw = true;
-        }
         if terminal::update_terminal_outputs(app) {
-            app.needs_redraw = true;
+            app.request_chat_repaint();
         }
-        if app.force_redraw {
-            terminal.clear()?;
-            app.force_redraw = false;
-            app.needs_redraw = true;
+        if matches!(app.terminal_lifecycle, TerminalLifecycleState::ReleasedToChild(_)) {
+            app.surface_dirty.clear_for_child_release();
+        } else {
+            terminal_runtime.apply_surface_rebuilds(app)?;
         }
-        if app.needs_redraw {
+        if app.surface_dirty.active_surface_needs_draw(app.terminal_lifecycle) {
             if let Some(ref mut perf) = app.perf {
                 perf.next_frame();
             }
@@ -250,17 +228,32 @@ pub async fn run_tui(app: &mut App) -> anyhow::Result<()> {
             {
                 let timer = app.perf.as_ref().map(|p| p.start("frame_total"));
                 let draw_timer = app.perf.as_ref().map(|p| p.start("frame::terminal_draw"));
-                terminal.draw(|f| crate::ui::render(f, app))?;
+                terminal_runtime.draw_active_surface(app)?;
                 drop(draw_timer);
                 drop(timer);
             }
-            app.needs_redraw = false;
             last_render = Instant::now();
         }
     }
 
-    // --- Graceful shutdown ---
+    Ok(())
+}
 
+fn handle_runtime_client_event(
+    app: &mut App,
+    event: ClientEvent,
+    service_status_check_started: &mut bool,
+) {
+    let start_service_status_check =
+        matches!(event, ClientEvent::Connected { .. }) && !*service_status_check_started;
+    events::handle_client_event(app, event);
+    if start_service_status_check {
+        *service_status_check_started = true;
+        service_status_check::start_service_status_check(app);
+    }
+}
+
+fn finish_run_tui(app: &mut App, terminal_runtime: &mut terminal_runtime::TerminalRuntime) {
     // Dismiss all pending inline permissions (reject via last option)
     for tool_id in std::mem::take(&mut app.pending_interaction_ids) {
         if let Some((mi, bi)) = app.tool_call_index.get(&tool_id).copied()
@@ -295,10 +288,7 @@ pub async fn run_tui(app: &mut App) -> anyhow::Result<()> {
 
     // Restore terminal
     tab_title::restore_tab_title(&app.cwd);
-    suspend_terminal();
-    ratatui::restore();
-
-    Ok(())
+    terminal_runtime.restore(app);
 }
 
 fn advance_spinner_frame(app: &mut App, now: Instant) {
@@ -372,7 +362,7 @@ fn finalize_pending_paste_event(app: &mut App) {
         && app.input.append_to_active_paste_block(&pasted);
     if appended {
         app.active_paste_session = Some(session);
-        app.needs_redraw = true;
+        app.request_chat_repaint();
         tracing::debug!(
             target: crate::logging::targets::APP_PASTE,
             event_name = "paste_placeholder_appended",
@@ -416,7 +406,7 @@ fn finalize_pending_paste_event(app: &mut App) {
             lines = app.input.lines().len(),
         );
     }
-    app.needs_redraw = true;
+    app.request_chat_repaint();
 }
 
 fn cursor_gt(a: SelectionPoint, b: SelectionPoint) -> bool {
@@ -571,12 +561,12 @@ mod tests {
     #[test]
     fn pending_paste_finalization_marks_redraw() {
         let mut app = App::test_default();
-        app.needs_redraw = false;
+        app.surface_dirty.chat.repaint = false;
         app.pending_paste_text = "hello\nworld".to_owned();
 
         finalize_pending_paste_event(&mut app);
 
-        assert!(app.needs_redraw);
+        assert!(app.surface_dirty.chat.repaint);
         assert_eq!(app.input.lines(), vec!["hello", "world"]);
     }
 
@@ -729,7 +719,7 @@ mod tests {
     }
 
     #[test]
-    fn sending_lone_question_mark_closes_help_overlay() {
+    fn sending_lone_question_mark_submits_as_prompt() {
         let (mut app, mut rx) = app_with_connection();
 
         events::handle_terminal_event(
@@ -738,7 +728,6 @@ mod tests {
         );
 
         assert_eq!(app.input.text(), "?");
-        assert!(app.is_help_active());
 
         events::handle_terminal_event(
             &mut app,
@@ -750,7 +739,6 @@ mod tests {
 
         assert!(app.pending_submit.is_none());
         assert!(app.input.text().is_empty());
-        assert!(!app.is_help_active());
         assert!(matches!(
             app.messages[0].blocks.as_slice(),
             [MessageBlock::Text(block)] if block.text == "?"

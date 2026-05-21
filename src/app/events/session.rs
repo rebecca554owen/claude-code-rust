@@ -4,11 +4,8 @@
 use super::super::connect::take_connection_slot;
 use super::super::connect::{SessionStartReason, start_new_session};
 use super::super::state::RecentSessionInfo;
-use super::super::view::{self, ActiveView};
-use super::super::{
-    App, AppStatus, ChatMessage, LoginHint, MessageBlock, MessageRole, SystemSeverity, TextBlock,
-    UpdateNoticeState,
-};
+use super::super::view::{self, FullscreenView};
+use super::super::{App, AppStatus, LoginHint, SystemSeverity, UpdateNoticeState};
 use super::push_system_message_with_severity;
 use super::session_reset::{load_resume_history, reset_for_new_session};
 use crate::agent::client::AgentConnection;
@@ -130,6 +127,7 @@ pub(super) fn handle_auth_required_event(
 ) {
     let method_name_for_log = method_name.clone();
     clear_pending_command(app);
+    app.status = AppStatus::Ready;
     app.resuming_session_id = None;
     app.login_hint = Some(LoginHint { method_name, method_description });
     app.bump_session_scope_epoch();
@@ -190,16 +188,10 @@ pub(super) fn handle_slash_command_error_event(app: &mut App, msg: &str) {
     if app.config.pending_session_title_change.take().is_some() {
         app.config.last_error = Some(msg.to_owned());
         app.config.status_message = None;
-        app.needs_redraw = true;
+        app.request_active_surface_repaint();
         return;
     }
-    app.push_message_tracked(ChatMessage::new(
-        MessageRole::System(None),
-        vec![MessageBlock::Text(TextBlock::from_complete(msg))],
-        None,
-    ));
-    app.enforce_history_retention_tracked();
-    app.viewport.engage_auto_scroll();
+    super::notices::emit_system_notice(app, SystemSeverity::Error, msg);
     clear_pending_command(app);
     app.resuming_session_id = None;
 }
@@ -213,7 +205,7 @@ pub(super) fn handle_auth_completed_event(app: &mut App, conn: &Rc<AgentConnecti
         Some(SystemSeverity::Info),
         "Authentication successful. Starting new session...",
     );
-    app.force_redraw = true;
+    app.request_chat_visible_rebuild();
     tracing::info!(
         target: crate::logging::targets::APP_AUTH,
         event_name = "login_completed",
@@ -247,7 +239,7 @@ pub(super) fn handle_logout_completed_event(app: &mut App) {
     app.mcp = super::super::McpState::default();
     app.config.pending_session_title_change = None;
     crate::app::usage::reset_for_session_change(app);
-    app.force_redraw = true;
+    app.request_chat_visible_rebuild();
     tracing::info!(
         target: crate::logging::targets::APP_AUTH,
         event_name = "logout_completed",
@@ -255,10 +247,10 @@ pub(super) fn handle_logout_completed_event(app: &mut App) {
         outcome = "success",
     );
 
-    if let Some(ref conn) = app.conn {
+    if let Some(conn) = app.conn.clone() {
         app.pending_command_label = Some("Starting session...".to_owned());
         app.pending_command_ack = None;
-        if let Err(e) = start_new_session(app, conn, SessionStartReason::Logout) {
+        if let Err(e) = start_new_session(app, &conn, SessionStartReason::Logout) {
             tracing::error!(
                 target: crate::logging::targets::APP_AUTH,
                 event_name = "logout_session_restart_failed",
@@ -308,6 +300,7 @@ pub(super) fn handle_session_replaced_event(
     apply_session_cwd(app, cwd);
     app.available_models = available_models;
     reset_for_new_session(app, session_id, current_model, mode, false);
+    app.request_chat_session_boundary_rebuild();
     app.sync_welcome_snapshot();
     if !history_updates.is_empty() {
         load_resume_history(app, history_updates);
@@ -413,11 +406,13 @@ pub(super) fn handle_fatal_error_event(app: &mut App, error: AppError) {
     app.pending_command_ack = None;
 }
 
-/// Clear the `CommandPending` state and restore `Ready`.
+/// Clear pending slash-command UI. Turn and session lifecycle handlers own non-command status.
 pub(super) fn clear_pending_command(app: &mut App) {
     app.pending_command_label = None;
     app.pending_command_ack = None;
-    app.status = AppStatus::Ready;
+    if matches!(app.status, AppStatus::CommandPending) {
+        app.status = AppStatus::Ready;
+    }
 }
 
 fn push_connection_error_message(app: &mut App, error: &str) {
@@ -490,7 +485,7 @@ fn maybe_open_startup_session_picker(app: &mut App) {
 
     app.session_picker.selected = app.session_picker.selected.min(session_count - 1);
     app.session_picker.scroll_offset = 0;
-    view::set_active_view(app, ActiveView::SessionPicker);
+    view::set_fullscreen_view(app, FullscreenView::SessionPicker);
 }
 
 #[cfg(test)]

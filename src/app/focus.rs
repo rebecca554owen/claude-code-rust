@@ -4,54 +4,35 @@
 /// Logical focus target that can claim directional key navigation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusTarget {
-    TodoList,
     Mention,
     Permission,
-    Help,
 }
 
 /// Effective owner of directional/navigation keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusOwner {
     Input,
-    TodoList,
     Mention,
     Permission,
-    Help,
 }
 
 #[derive(Debug, Clone, Copy)]
-#[allow(clippy::struct_excessive_bools)]
 pub struct FocusContext {
-    pub todo_focus_available: bool,
     pub mention_active: bool,
     pub permission_active: bool,
-    pub help_active: bool,
 }
 
 impl FocusContext {
     #[must_use]
-    pub const fn new(
-        todo_focus_available: bool,
-        mention_active: bool,
-        permission_active: bool,
-    ) -> Self {
-        Self { todo_focus_available, mention_active, permission_active, help_active: false }
-    }
-
-    #[must_use]
-    pub const fn with_help(mut self, help_active: bool) -> Self {
-        self.help_active = help_active;
-        self
+    pub const fn new(mention_active: bool, permission_active: bool) -> Self {
+        Self { mention_active, permission_active }
     }
 
     #[must_use]
     pub const fn supports(self, target: FocusTarget) -> bool {
         match target {
-            FocusTarget::TodoList => self.todo_focus_available,
             FocusTarget::Mention => self.mention_active,
             FocusTarget::Permission => self.permission_active,
-            FocusTarget::Help => self.help_active,
         }
     }
 }
@@ -59,10 +40,8 @@ impl FocusContext {
 impl From<FocusTarget> for FocusOwner {
     fn from(value: FocusTarget) -> Self {
         match value {
-            FocusTarget::TodoList => Self::TodoList,
             FocusTarget::Mention => Self::Mention,
             FocusTarget::Permission => Self::Permission,
-            FocusTarget::Help => Self::Help,
         }
     }
 }
@@ -114,15 +93,14 @@ mod tests {
     #[test]
     fn owner_defaults_to_input_without_claims() {
         let mgr = FocusManager::default();
-        let ctx = FocusContext::new(false, false, false);
+        let ctx = FocusContext::new(false, false);
         assert_eq!(mgr.owner(ctx), FocusOwner::Input);
     }
 
     #[test]
     fn latest_valid_claim_wins() {
         let mut mgr = FocusManager::default();
-        let ctx = FocusContext::new(true, true, true);
-        mgr.claim(FocusTarget::TodoList, ctx);
+        let ctx = FocusContext::new(true, true);
         mgr.claim(FocusTarget::Permission, ctx);
         mgr.claim(FocusTarget::Mention, ctx);
         assert_eq!(mgr.owner(ctx), FocusOwner::Mention);
@@ -131,19 +109,11 @@ mod tests {
     #[test]
     fn invalid_claims_are_normalized_out() {
         let mut mgr = FocusManager::default();
-        let valid_ctx = FocusContext::new(true, false, false);
-        let invalid_ctx = FocusContext::new(false, false, false);
-        mgr.claim(FocusTarget::TodoList, valid_ctx);
-        assert_eq!(mgr.owner(valid_ctx), FocusOwner::TodoList);
+        let valid_ctx = FocusContext::new(true, false);
+        let invalid_ctx = FocusContext::new(false, false);
+        mgr.claim(FocusTarget::Mention, valid_ctx);
+        assert_eq!(mgr.owner(valid_ctx), FocusOwner::Mention);
         mgr.normalize(invalid_ctx);
         assert_eq!(mgr.owner(invalid_ctx), FocusOwner::Input);
-    }
-
-    #[test]
-    fn help_focus_target_works_when_enabled() {
-        let mut mgr = FocusManager::default();
-        let ctx = FocusContext::new(false, false, false).with_help(true);
-        mgr.claim(FocusTarget::Help, ctx);
-        assert_eq!(mgr.owner(ctx), FocusOwner::Help);
     }
 }

@@ -60,10 +60,10 @@ pub(super) fn invalidate_if_changed(
 }
 
 pub(super) fn set_interaction_focused(app: &mut App, queue_index: usize, focused: bool) {
-    let Some(tool_id) = app.pending_interaction_ids.get(queue_index) else {
+    let Some(tool_id) = app.pending_interaction_ids.get(queue_index).cloned() else {
         return;
     };
-    let Some((mi, bi)) = app.tool_call_index.get(tool_id).copied() else {
+    let Some((mi, bi)) = app.tool_call_index.get(&tool_id).copied() else {
         return;
     };
     let mut invalidated = false;
@@ -75,20 +75,21 @@ pub(super) fn set_interaction_focused(app: &mut App, queue_index: usize, focused
             && perm.focused != focused
         {
             perm.focused = focused;
-            tc.mark_tool_call_layout_dirty();
+            tc.invalidate_render_cache();
             invalidated = true;
         }
         if let Some(ref mut question) = tc.pending_question
             && question.focused != focused
         {
             question.focused = focused;
-            tc.mark_tool_call_layout_dirty();
+            tc.invalidate_render_cache();
             invalidated = true;
         }
     }
     if invalidated {
         app.sync_render_cache_slot(mi, bi);
         app.invalidate_layout(InvalidationLevel::MessageChanged(mi));
+        app.request_chat_mutable_rebuild();
     }
 }
 
@@ -102,10 +103,10 @@ pub(super) fn focused_interaction_is_active(app: &App) -> bool {
 pub(super) fn clear_inline_interaction_focus(app: &mut App) {
     let mut changed = false;
     for idx in 0..app.pending_interaction_ids.len() {
-        let Some(tool_id) = app.pending_interaction_ids.get(idx) else {
+        let Some(tool_id) = app.pending_interaction_ids.get(idx).cloned() else {
             continue;
         };
-        let Some((mi, bi)) = app.tool_call_index.get(tool_id).copied() else {
+        let Some((mi, bi)) = app.tool_call_index.get(&tool_id).copied() else {
             continue;
         };
         if let Some(msg) = app.messages.get_mut(mi)
@@ -126,10 +127,11 @@ pub(super) fn clear_inline_interaction_focus(app: &mut App) {
                 interaction_changed = true;
             }
             if interaction_changed {
-                tc.mark_tool_call_layout_dirty();
+                tc.invalidate_render_cache();
                 app.sync_render_cache_slot(mi, bi);
                 app.recompute_message_retained_bytes(mi);
                 app.invalidate_layout(InvalidationLevel::MessageChanged(mi));
+                app.request_chat_mutable_rebuild();
                 changed = true;
             }
         }
@@ -218,7 +220,6 @@ pub(super) fn handle_interaction_focus_cycle(
     }
 
     set_interaction_focused(app, 0, true);
-    app.viewport.engage_auto_scroll();
     Some(true)
 }
 

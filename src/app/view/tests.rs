@@ -2,24 +2,15 @@ use super::*;
 use crate::app::config::{ConfigOverlayState, OutputStyle, OutputStyleOverlayState};
 use crate::app::dialog::DialogState;
 use crate::app::slash::{SlashContext, SlashState};
-use crate::app::state::types::ScrollbarDragState;
 use crate::app::subagent::SubagentState;
 use crate::app::{
-    FocusTarget, PasteSessionState, SelectionKind, SelectionPoint, SelectionState, TodoItem,
-    TodoStatus,
+    FocusTarget, FullscreenView, PasteSessionState, ReleaseReason, SelectionPoint, SurfaceMode,
+    TerminalLifecycleState,
 };
 
 fn busy_view_test_app() -> App {
     let mut app = App::test_default();
     app.input.set_text("draft");
-    app.selection = Some(SelectionState {
-        kind: SelectionKind::Chat,
-        start: SelectionPoint { row: 0, col: 0 },
-        end: SelectionPoint { row: 0, col: 4 },
-        dragging: true,
-    });
-    app.scrollbar_drag =
-        Some(ScrollbarDragState { thumb_grab_offset: 1, track_space: 4, max_scroll: 12 });
     app.pending_submit = Some(app.input.snapshot());
     app.pending_paste_text = "blocked".to_owned();
     app.pending_paste_session = Some(PasteSessionState {
@@ -48,28 +39,21 @@ fn busy_view_test_app() -> App {
         candidates: vec![],
         dialog: DialogState::default(),
     });
-    app.show_todo_panel = true;
-    app.todos = vec![TodoItem {
-        content: "todo".to_owned(),
-        status: TodoStatus::Pending,
-        active_form: "todo".to_owned(),
-    }];
-    app.claim_focus_target(FocusTarget::TodoList);
     app.pending_interaction_ids.push("perm-1".to_owned());
     app.claim_focus_target(FocusTarget::Permission);
     app
 }
 
 #[test]
-fn set_active_view_clears_transient_chat_state_but_keeps_draft() {
+fn set_surface_mode_clears_transient_chat_state_but_keeps_draft() {
     let mut app = busy_view_test_app();
+    app.chat_render.live_region.anchor_valid = true;
+    app.chat_render.live_region.last_rendered_rows = 5;
 
-    set_active_view(&mut app, ActiveView::Trusted);
+    set_surface_mode(&mut app, SurfaceMode::Fullscreen(FullscreenView::Trusted));
 
-    assert_eq!(app.active_view, ActiveView::Trusted);
+    assert_eq!(app.surface_mode, SurfaceMode::Fullscreen(FullscreenView::Trusted));
     assert_eq!(app.input.text(), "draft");
-    assert!(app.selection.is_none());
-    assert!(app.scrollbar_drag.is_none());
     assert!(app.mention.is_none());
     assert!(app.slash.is_none());
     assert!(app.subagent.is_none());
@@ -77,76 +61,117 @@ fn set_active_view_clears_transient_chat_state_but_keeps_draft() {
     assert!(app.pending_paste_session.is_none());
     assert!(app.active_paste_session.is_none());
     assert!(app.pending_submit.is_none());
+    assert!(!app.chat_render.live_region.anchor_valid);
+    assert_eq!(app.chat_render.live_region.last_rendered_rows, 0);
 }
 
 #[test]
-fn set_active_view_switches_to_config_from_trusted() {
+fn set_surface_mode_switches_to_config_from_trusted() {
     let mut app = busy_view_test_app();
-    app.active_view = ActiveView::Trusted;
+    app.surface_mode = SurfaceMode::Fullscreen(FullscreenView::Trusted);
 
-    set_active_view(&mut app, ActiveView::Config);
+    set_surface_mode(&mut app, SurfaceMode::Fullscreen(FullscreenView::Config));
 
-    assert_eq!(app.active_view, ActiveView::Config);
-    assert!(app.selection.is_none());
+    assert_eq!(app.surface_mode, SurfaceMode::Fullscreen(FullscreenView::Config));
     assert!(app.pending_paste_text.is_empty());
 }
 
 #[test]
-fn set_active_view_same_view_is_noop() {
+fn set_surface_mode_same_view_is_noop() {
     let mut app = busy_view_test_app();
-    app.needs_redraw = false;
+    app.surface_dirty.chat.repaint = false;
 
-    set_active_view(&mut app, ActiveView::Chat);
+    set_surface_mode(&mut app, SurfaceMode::Chat);
 
-    assert_eq!(app.active_view, ActiveView::Chat);
-    assert!(app.selection.is_some());
+    assert_eq!(app.surface_mode, SurfaceMode::Chat);
     assert!(app.mention.is_some());
     assert!(!app.pending_paste_text.is_empty());
     assert!(app.pending_submit.is_some());
-    assert!(!app.needs_redraw);
+    assert!(!app.surface_dirty.chat.repaint);
 }
 
 #[test]
-fn set_active_view_keeps_permission_unfocused_when_returning_to_chat_with_draft() {
+fn set_surface_mode_keeps_permission_unfocused_when_returning_to_chat_with_draft() {
     let mut app = busy_view_test_app();
 
-    set_active_view(&mut app, ActiveView::Trusted);
-    assert_eq!(app.active_view, ActiveView::Trusted);
+    set_surface_mode(&mut app, SurfaceMode::Fullscreen(FullscreenView::Trusted));
+    assert_eq!(app.surface_mode, SurfaceMode::Fullscreen(FullscreenView::Trusted));
 
-    set_active_view(&mut app, ActiveView::Chat);
+    set_surface_mode(&mut app, SurfaceMode::Chat);
 
-    assert_eq!(app.active_view, ActiveView::Chat);
-    assert_eq!(app.focus_owner(), crate::app::FocusOwner::TodoList);
-}
-
-#[test]
-fn set_active_view_closes_help_without_clearing_question_mark_draft() {
-    let mut app = App::test_default();
-    app.input.set_text("?");
-    app.help_open = true;
-    app.help_view = crate::app::HelpView::Subagents;
-    app.help_visible_count = 7;
-
-    set_active_view(&mut app, ActiveView::Trusted);
-    assert_eq!(app.input.text(), "?");
-    assert!(!app.is_help_active());
-    assert_eq!(app.help_view, crate::app::HelpView::Keys);
-    assert_eq!(app.help_visible_count, 0);
-
-    set_active_view(&mut app, ActiveView::Chat);
-    assert_eq!(app.input.text(), "?");
-    assert!(!app.is_help_active());
+    assert_eq!(app.surface_mode, SurfaceMode::Chat);
+    assert_eq!(app.focus_owner(), crate::app::FocusOwner::Input);
 }
 
 #[test]
 fn leaving_config_clears_config_overlay() {
     let mut app = App::test_default();
-    app.active_view = ActiveView::Config;
+    app.surface_mode = SurfaceMode::Fullscreen(FullscreenView::Config);
     app.config.overlay = Some(ConfigOverlayState::OutputStyle(OutputStyleOverlayState {
         selected: OutputStyle::Default,
     }));
 
-    set_active_view(&mut app, ActiveView::Trusted);
+    set_surface_mode(&mut app, SurfaceMode::Fullscreen(FullscreenView::Trusted));
 
     assert!(app.config.overlay.is_none());
+}
+
+#[test]
+fn surface_mode_reports_fullscreen_view_only_for_fullscreen_modes() {
+    assert_eq!(SurfaceMode::Chat.fullscreen_view(), None);
+    assert_eq!(
+        SurfaceMode::Fullscreen(FullscreenView::Config).fullscreen_view(),
+        Some(FullscreenView::Config)
+    );
+    assert_eq!(
+        SurfaceMode::Fullscreen(FullscreenView::Trusted).fullscreen_view(),
+        Some(FullscreenView::Trusted)
+    );
+    assert_eq!(
+        SurfaceMode::Fullscreen(FullscreenView::SessionPicker).fullscreen_view(),
+        Some(FullscreenView::SessionPicker)
+    );
+}
+
+#[test]
+fn set_surface_mode_updates_surface_and_lifecycle_while_running() {
+    let mut app = App::test_default();
+    app.chat_render.live_region.anchor_valid = true;
+
+    set_surface_mode(&mut app, SurfaceMode::Fullscreen(FullscreenView::Config));
+
+    assert_eq!(app.surface_mode, SurfaceMode::Fullscreen(FullscreenView::Config));
+    assert_eq!(app.surface_mode, SurfaceMode::Fullscreen(FullscreenView::Config));
+    assert_eq!(
+        app.terminal_lifecycle,
+        TerminalLifecycleState::Running(SurfaceMode::Fullscreen(FullscreenView::Config))
+    );
+    assert!(app.surface_dirty.fullscreen.redraw);
+    assert!(app.surface_dirty.terminal_mode);
+    assert!(!app.chat_render.live_region.anchor_valid);
+}
+
+#[test]
+fn set_surface_mode_preserves_non_running_lifecycle_states() {
+    let mut released_app = App::test_default();
+    released_app.terminal_lifecycle =
+        TerminalLifecycleState::ReleasedToChild(ReleaseReason::AuthFlow);
+    set_surface_mode(&mut released_app, SurfaceMode::Fullscreen(FullscreenView::Trusted));
+    assert_eq!(
+        released_app.terminal_lifecycle,
+        TerminalLifecycleState::ReleasedToChild(ReleaseReason::AuthFlow)
+    );
+    assert_eq!(released_app.surface_mode, SurfaceMode::Fullscreen(FullscreenView::Trusted));
+
+    let mut restoring_app = App::test_default();
+    restoring_app.terminal_lifecycle = TerminalLifecycleState::Restoring;
+    set_surface_mode(&mut restoring_app, SurfaceMode::Fullscreen(FullscreenView::Config));
+    assert_eq!(restoring_app.terminal_lifecycle, TerminalLifecycleState::Restoring);
+    assert_eq!(restoring_app.surface_mode, SurfaceMode::Fullscreen(FullscreenView::Config));
+
+    let mut exited_app = App::test_default();
+    exited_app.terminal_lifecycle = TerminalLifecycleState::Exited;
+    set_surface_mode(&mut exited_app, SurfaceMode::Fullscreen(FullscreenView::SessionPicker));
+    assert_eq!(exited_app.terminal_lifecycle, TerminalLifecycleState::Exited);
+    assert_eq!(exited_app.surface_mode, SurfaceMode::Fullscreen(FullscreenView::SessionPicker));
 }

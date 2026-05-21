@@ -27,7 +27,6 @@ pub(super) fn submit_input(app: &mut App) {
     if slash::is_cancel_command(&text) {
         app.pending_auto_submit_after_cancel = false;
         app.input.clear();
-        app.sync_help_open_with_input();
         dispatch_submission(app, text);
         return;
     }
@@ -61,7 +60,6 @@ pub(super) fn submit_input(app: &mut App) {
 
     app.pending_auto_submit_after_cancel = false;
     app.input.clear();
-    app.sync_help_open_with_input();
     dispatch_submission(app, text);
 }
 
@@ -158,7 +156,6 @@ fn dispatch_prompt_turn(app: &mut App, text: String) {
     app.bind_active_turn_assistant_to_tail();
     app.enforce_history_retention_tracked();
     app.status = AppStatus::Thinking;
-    app.viewport.engage_auto_scroll();
 
     let tx = app.event_tx.clone();
     // The text already contains [Image #N] badges from the textarea,
@@ -187,7 +184,7 @@ fn dispatch_prompt_turn(app: &mut App, text: String) {
 mod tests {
     use super::*;
     use crate::agent::wire::BridgeCommand;
-    use crate::app::ActiveView;
+    use crate::app::{FullscreenView, SurfaceMode};
 
     fn app_with_connection()
     -> (App, tokio::sync::mpsc::UnboundedReceiver<crate::agent::wire::CommandEnvelope>) {
@@ -306,16 +303,99 @@ mod tests {
     fn local_slash_submit_marks_redraw() {
         let (mut app, _rx) = app_with_connection();
         app.input.set_text("/docs commands");
-        app.needs_redraw = false;
+        app.surface_dirty.chat.repaint = false;
 
         submit_input(&mut app);
 
-        assert!(app.needs_redraw);
+        assert!(app.surface_dirty.chat.repaint);
         assert!(app.input.text().is_empty());
         let Some(last) = app.messages.last() else {
             panic!("expected docs system message");
         };
         assert!(matches!(last.role, MessageRole::System(Some(super::super::SystemSeverity::Info))));
+    }
+
+    #[test]
+    fn supported_advertised_slash_submit_falls_through_to_prompt_turn() {
+        let (mut app, mut rx) = app_with_connection();
+        app.available_commands =
+            vec![model::AvailableCommand::new("/remote-command", "Remote command")];
+        app.input.set_text("/remote-command");
+
+        submit_input(&mut app);
+
+        assert!(app.input.text().is_empty());
+        assert!(matches!(app.status, AppStatus::Thinking));
+        assert_eq!(app.messages.len(), 2);
+        assert!(matches!(app.messages[0].role, MessageRole::User));
+        assert!(matches!(app.messages[1].role, MessageRole::Assistant));
+        let envelope = rx.try_recv().expect("advertised slash command should be sent");
+        match envelope.command {
+            BridgeCommand::Prompt { session_id, chunks } => {
+                assert_eq!(session_id, "session-1");
+                assert_eq!(chunks.len(), 1);
+                assert_eq!(chunks[0].kind, "text");
+                assert_eq!(
+                    chunks[0].value,
+                    serde_json::Value::String("/remote-command".to_owned())
+                );
+            }
+            other => panic!("expected prompt command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_slash_submit_opens_config_without_prompt_turn() {
+        let (mut app, mut rx) = app_with_connection();
+        let dir = tempfile::tempdir().expect("tempdir");
+        app.settings_home_override = Some(dir.path().to_path_buf());
+        app.cwd_raw = dir.path().to_string_lossy().to_string();
+        app.input.set_text("/config");
+
+        submit_input(&mut app);
+
+        assert_eq!(app.surface_mode, SurfaceMode::Fullscreen(FullscreenView::Config));
+        assert!(app.input.text().is_empty());
+        assert!(matches!(app.status, AppStatus::Ready));
+        assert!(rx.try_recv().is_err(), "config open should not dispatch a prompt turn");
+    }
+
+    #[test]
+    fn local_custom_slash_submit_is_consumed() {
+        let (mut app, mut rx) = app_with_connection();
+        let dir = tempfile::tempdir().expect("tempdir");
+        app.settings_home_override = Some(dir.path().to_path_buf());
+        app.cwd_raw = dir.path().to_string_lossy().to_string();
+        app.input.set_text("/1m-context status");
+
+        submit_input(&mut app);
+
+        assert!(app.input.text().is_empty());
+        assert!(matches!(app.status, AppStatus::Ready));
+        let Some(last) = app.messages.last() else {
+            panic!("expected /1m-context status message");
+        };
+        assert!(matches!(last.role, MessageRole::System(Some(super::super::SystemSeverity::Info))));
+        assert!(rx.try_recv().is_err(), "local custom slash command should not dispatch a prompt");
+    }
+
+    #[test]
+    fn auth_slash_usage_error_is_consumed() {
+        let (mut app, mut rx) = app_with_connection();
+        app.input.set_text("/login extra");
+
+        submit_input(&mut app);
+
+        assert!(app.input.text().is_empty());
+        assert!(matches!(app.status, AppStatus::Ready));
+        let Some(last) = app.messages.last() else {
+            panic!("expected /login usage message");
+        };
+        assert!(matches!(
+            last.role,
+            MessageRole::System(Some(super::super::SystemSeverity::Error))
+        ));
+        assert!(rx.try_recv().is_err(), "auth slash usage error should not dispatch a prompt");
     }
 
     #[test]
@@ -339,6 +419,10 @@ mod tests {
         assert!(app.input.text().is_empty());
         assert!(matches!(app.status, AppStatus::Thinking));
         assert_eq!(app.messages.len(), 2);
+        assert_eq!(app.active_turn_assistant_idx(), Some(1));
+        assert!(matches!(app.messages[0].role, MessageRole::User));
+        assert!(matches!(app.messages[1].role, MessageRole::Assistant));
+        assert!(app.messages[1].blocks.is_empty());
         let prompt = rx.try_recv().expect("prompt command should be sent");
         assert!(matches!(
             prompt.command,
@@ -357,7 +441,7 @@ mod tests {
 
         submit_input(&mut app);
 
-        assert_eq!(app.active_view, ActiveView::Chat);
+        assert_eq!(app.surface_mode, SurfaceMode::Chat);
         assert_eq!(app.input.text(), "/config");
         assert_eq!(app.pending_cancel_origin, Some(CancelOrigin::AutoQueue));
         assert!(app.pending_auto_submit_after_cancel);
@@ -371,7 +455,7 @@ mod tests {
         maybe_auto_submit_after_cancel(&mut app);
 
         assert!(!app.pending_auto_submit_after_cancel);
-        assert_eq!(app.active_view, ActiveView::Config);
+        assert_eq!(app.surface_mode, SurfaceMode::Fullscreen(FullscreenView::Config));
         assert!(app.input.text().is_empty());
         assert!(matches!(app.status, AppStatus::Ready));
         assert!(rx.try_recv().is_err(), "config open should not dispatch a prompt turn");

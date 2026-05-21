@@ -3,61 +3,50 @@
 
 use crate::agent::model;
 use crate::app::{App, MessageBlock, MessageRole};
-use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use crate::ui::theme;
+use ratatui::buffer::Buffer;
+use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Paragraph, Widget};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::theme;
-
-const FOOTER_PAD: u16 = 2;
 const FOOTER_COLUMN_GAP: u16 = 1;
 const PRIMARY_ROW_LEFT_MIN_WIDTH: u16 = 24;
 const SECONDARY_ROW_LEFT_MIN_WIDTH: u16 = 28;
 const MIN_CONTEXT_LOCATION_WIDTH: usize = 10;
 const MIN_CONTEXT_BRANCH_WIDTH: usize = 4;
-type FooterItem = Option<(String, Color)>;
 const FOOTER_CONTEXT_VALUE: Color = Color::Gray;
 
-pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
-    if area.height == 0 {
-        return;
-    }
+type FooterItem = Option<(String, Color)>;
 
-    let padded = Rect {
-        x: area.x.saturating_add(FOOTER_PAD),
-        y: area.y,
-        width: area.width.saturating_sub(FOOTER_PAD * 2),
-        height: area.height,
-    };
+pub(crate) struct SerializedFooterRows {
+    pub rows: [Line<'static>; 2],
+}
 
-    let [first_row, second_row] =
-        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(padded);
-
-    let first_line = build_primary_line(app);
-    render_footer_row(
-        frame,
-        first_row,
-        first_line,
+pub(crate) fn serialize_footer_rows(app: &App, total_width: u16) -> SerializedFooterRows {
+    let first_row = compose_footer_row(
+        build_primary_line(app),
         footer_primary_hint(app),
+        total_width,
         PRIMARY_ROW_LEFT_MIN_WIDTH,
     );
 
     let second_hint = footer_secondary_hint(app);
-    let (second_left, second_right) = split_footer_columns_hint(
-        second_row,
+    let second_left_width = footer_row_widths(
+        total_width,
         second_hint.as_ref().map(|(text, _)| text.as_str()),
         SECONDARY_ROW_LEFT_MIN_WIDTH,
+    )
+    .0;
+    let second_row = compose_footer_row(
+        build_context_line(app, usize::from(second_left_width)),
+        second_hint,
+        total_width,
+        SECONDARY_ROW_LEFT_MIN_WIDTH,
     );
-    frame.render_widget(
-        Paragraph::new(build_context_line(app, usize::from(second_left.width))),
-        second_left,
-    );
-    if let Some((hint_text, hint_color)) = second_hint {
-        render_footer_right_info(frame, second_right, &hint_text, hint_color);
-    }
+
+    SerializedFooterRows { rows: [first_row, second_row] }
 }
 
 fn footer_primary_hint(app: &App) -> FooterItem {
@@ -85,62 +74,68 @@ fn footer_secondary_hint(app: &App) -> FooterItem {
     footer_mcp_auth_hint(app).or_else(|| footer_context_usage_hint(app))
 }
 
-fn render_footer_row(
-    frame: &mut Frame,
-    area: Rect,
-    left_line: Line<'static>,
-    right_hint: FooterItem,
-    left_min_width: u16,
-) {
-    let (left_area, right_area) = split_footer_columns_hint(
-        area,
-        right_hint.as_ref().map(|(text, _)| text.as_str()),
-        left_min_width,
-    );
-    frame.render_widget(Paragraph::new(left_line), left_area);
-    if let Some((hint_text, hint_color)) = right_hint {
-        render_footer_right_info(frame, right_area, &hint_text, hint_color);
-    }
-}
-
-fn split_footer_columns_hint(
-    area: Rect,
+fn footer_row_widths(
+    total_width: u16,
     right_text: Option<&str>,
     left_min_width: u16,
-) -> (Rect, Rect) {
-    if area.width == 0 {
-        return (area, zero_width_rect(area));
+) -> (u16, u16) {
+    if total_width == 0 {
+        return (0, 0);
     }
 
     let Some(right_text) = right_text else {
-        return (area, zero_width_rect(area));
+        return (total_width, 0);
     };
 
-    let left_min_width = left_min_width.min(area.width);
+    let left_min_width = left_min_width.min(total_width);
     let available_right =
-        area.width.saturating_sub(left_min_width).saturating_sub(FOOTER_COLUMN_GAP);
+        total_width.saturating_sub(left_min_width).saturating_sub(FOOTER_COLUMN_GAP);
     if available_right == 0 {
-        return (area, zero_width_rect(area));
+        return (total_width, 0);
     }
 
     let natural_right_width = u16::try_from(UnicodeWidthStr::width(right_text)).unwrap_or(u16::MAX);
     let right_width = natural_right_width.min(available_right);
     if right_width == 0 {
-        return (area, zero_width_rect(area));
+        return (total_width, 0);
     }
 
-    let left_width = area.width.saturating_sub(right_width).saturating_sub(FOOTER_COLUMN_GAP);
-    let left = Rect { width: left_width, ..area };
-    let right = Rect {
-        x: left.x.saturating_add(left_width).saturating_add(FOOTER_COLUMN_GAP),
-        width: right_width,
-        ..area
-    };
-    (left, right)
+    let left_width = total_width.saturating_sub(right_width).saturating_sub(FOOTER_COLUMN_GAP);
+    (left_width, right_width)
 }
 
-fn zero_width_rect(area: Rect) -> Rect {
-    Rect { x: area.x.saturating_add(area.width), width: 0, ..area }
+fn compose_footer_row(
+    left: Line<'static>,
+    right: FooterItem,
+    total_width: u16,
+    left_min_width: u16,
+) -> Line<'static> {
+    if total_width == 0 {
+        return Line::default();
+    }
+
+    let (left_width, right_width) = footer_row_widths(
+        total_width,
+        right.as_ref().map(|(text, _)| text.as_str()),
+        left_min_width,
+    );
+
+    let area = Rect::new(0, 0, total_width, 1);
+    let mut buf = Buffer::empty(area);
+    let left_area = Rect::new(0, 0, left_width, 1);
+    Paragraph::new(left).render(left_area, &mut buf);
+
+    if let Some((right_text, right_color)) = right
+        && right_width > 0
+        && let Some(fitted) = fit_footer_right_text(&right_text, usize::from(right_width))
+    {
+        let right_x = left_width.saturating_add(FOOTER_COLUMN_GAP);
+        let right_area = Rect::new(right_x, 0, right_width, 1);
+        let line = Line::from(Span::styled(fitted, Style::default().fg(right_color)));
+        Paragraph::new(line).alignment(Alignment::Right).render(right_area, &mut buf);
+    }
+
+    buffer_row_to_line(&buf, area, 0)
 }
 
 fn build_primary_line(app: &App) -> Line<'static> {
@@ -155,15 +150,16 @@ fn build_primary_line(app: &App) -> Line<'static> {
         }
         spans.push(Span::raw("  "));
         push_badge(&mut spans, fast_mode_text.to_owned(), fast_mode_color);
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled("?", Style::default().fg(Color::White)));
-        spans.push(Span::styled(" : Help", Style::default().fg(theme::DIM)));
         Line::from(spans)
     } else {
-        Line::from(vec![
-            Span::styled("?", Style::default().fg(Color::White)),
-            Span::styled(" : Help", Style::default().fg(theme::DIM)),
-        ])
+        let (fast_mode_text, fast_mode_color) = fast_mode_badge(app.fast_mode_state);
+        let mut spans = Vec::new();
+        if let Some((status_text, status_color)) = startup_status_badge(app) {
+            push_badge(&mut spans, status_text.to_owned(), status_color);
+            spans.push(Span::raw("  "));
+        }
+        push_badge(&mut spans, fast_mode_text.to_owned(), fast_mode_color);
+        Line::from(spans)
     }
 }
 
@@ -189,49 +185,6 @@ const fn footer_effort_label(effort: model::EffortLevel) -> &'static str {
         model::EffortLevel::Medium => "Med",
         model::EffortLevel::High => "High",
     }
-}
-
-fn fit_footer_right_text(text: &str, max_width: usize) -> Option<String> {
-    if max_width == 0 || text.trim().is_empty() {
-        return None;
-    }
-
-    if UnicodeWidthStr::width(text) <= max_width {
-        return Some(text.to_owned());
-    }
-
-    if max_width <= 3 {
-        return Some(".".repeat(max_width));
-    }
-
-    let mut fitted = String::new();
-    let mut width: usize = 0;
-    for ch in text.chars() {
-        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if width.saturating_add(ch_width).saturating_add(3) > max_width {
-            break;
-        }
-        fitted.push(ch);
-        width = width.saturating_add(ch_width);
-    }
-
-    if fitted.is_empty() {
-        return Some("...".to_owned());
-    }
-    fitted.push_str("...");
-    Some(fitted)
-}
-
-fn render_footer_right_info(frame: &mut Frame, area: Rect, right_text: &str, right_color: Color) {
-    if area.width == 0 {
-        return;
-    }
-    let Some(fitted) = fit_footer_right_text(right_text, usize::from(area.width)) else {
-        return;
-    };
-
-    let line = Line::from(Span::styled(fitted, Style::default().fg(right_color)));
-    frame.render_widget(Paragraph::new(line).alignment(Alignment::Right), area);
 }
 
 fn build_context_line(app: &App, max_width: usize) -> Line<'static> {
@@ -323,6 +276,37 @@ fn push_unique(candidates: &mut Vec<String>, candidate: Option<String>) {
     }
 }
 
+fn fit_footer_right_text(text: &str, max_width: usize) -> Option<String> {
+    if max_width == 0 || text.trim().is_empty() {
+        return None;
+    }
+
+    if UnicodeWidthStr::width(text) <= max_width {
+        return Some(text.to_owned());
+    }
+
+    if max_width <= 3 {
+        return Some(".".repeat(max_width));
+    }
+
+    let mut fitted = String::new();
+    let mut width: usize = 0;
+    for ch in text.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width.saturating_add(ch_width).saturating_add(3) > max_width {
+            break;
+        }
+        fitted.push(ch);
+        width = width.saturating_add(ch_width);
+    }
+
+    if fitted.is_empty() {
+        return Some("...".to_owned());
+    }
+    fitted.push_str("...");
+    Some(fitted)
+}
+
 fn fit_footer_suffix_text(text: &str, max_width: usize) -> Option<String> {
     if max_width == 0 || text.trim().is_empty() {
         return None;
@@ -403,50 +387,100 @@ fn fast_mode_badge(state: model::FastModeState) -> (&'static str, Color) {
     }
 }
 
+fn startup_status_badge(app: &App) -> Option<(&'static str, Color)> {
+    match app.status {
+        crate::app::AppStatus::Connecting => None,
+        crate::app::AppStatus::Ready => Some(("READY", theme::DIM)),
+        crate::app::AppStatus::CommandPending
+        | crate::app::AppStatus::Thinking
+        | crate::app::AppStatus::Running => Some(("WORKING", Color::Yellow)),
+        crate::app::AppStatus::Error => Some(("ERROR", theme::STATUS_ERROR)),
+    }
+}
+
+fn buffer_row_to_line(buf: &Buffer, area: Rect, row: u16) -> Line<'static> {
+    let y = area.y.saturating_add(row);
+    let mut cells = Vec::with_capacity(usize::from(area.width));
+    for x in 0..area.width {
+        if let Some(cell) = buf.cell((area.x.saturating_add(x), y)) {
+            cells.push((cell.symbol().to_owned(), cell.style()));
+        }
+    }
+
+    let Some(last_non_blank) = cells
+        .iter()
+        .rposition(|(symbol, _)| !symbol.is_empty() && !symbol.chars().all(char::is_whitespace))
+    else {
+        return Line::default();
+    };
+
+    let mut spans = Vec::new();
+    let mut current_style: Option<Style> = None;
+    let mut current_text = String::new();
+
+    for (symbol, style) in cells.into_iter().take(last_non_blank + 1) {
+        if symbol.is_empty() {
+            continue;
+        }
+        match current_style {
+            Some(existing) if existing == style => current_text.push_str(&symbol),
+            Some(existing) => {
+                spans.push(Span::styled(std::mem::take(&mut current_text), existing));
+                current_text.push_str(&symbol);
+                current_style = Some(style);
+            }
+            None => {
+                current_text.push_str(&symbol);
+                current_style = Some(style);
+            }
+        }
+    }
+
+    if let Some(style) = current_style
+        && !current_text.is_empty()
+    {
+        spans.push(Span::styled(current_text, style));
+    }
+
+    Line::from(spans)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::model;
     use crate::agent::types::{McpServerConnectionStatus, McpServerStatus};
     use crate::app::{
-        App, BlockCache, ChatMessage, InlinePermission, MessageBlock, MessageRole,
-        TerminalSnapshotMode, TextBlock, ToolCallInfo,
+        App, AppStatus, BlockCache, ChatMessage, InlinePermission, MessageBlock, MessageRole,
+        ModeState, TerminalSnapshotMode, ToolCallInfo,
     };
     use tokio::sync::oneshot;
 
-    #[test]
-    fn split_footer_columns_hint_left_gets_its_minimum() {
-        let area = Rect::new(0, 0, 80, 1);
-        let left_min = 24u16;
-        let (left, right) = split_footer_columns_hint(area, Some("1 PEND. PERM."), left_min);
-        assert_eq!(left.width + FOOTER_COLUMN_GAP + right.width, 80);
-        assert!(left.width >= left_min);
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|span| span.content.as_ref()).collect()
+    }
+
+    fn app_with_mode() -> App {
+        let mut app = App::test_default();
+        app.mode = Some(ModeState {
+            current_mode_id: "default".to_owned(),
+            current_mode_name: "default".to_owned(),
+            available_modes: Vec::new(),
+        });
+        app
     }
 
     #[test]
-    fn split_footer_columns_hint_reserves_natural_right_width() {
-        let area = Rect::new(0, 0, 80, 1);
-        let left_min = 24u16;
-        let right_text = "1 PEND. PERM.";
-        let (left, right) = split_footer_columns_hint(area, Some(right_text), left_min);
-        assert_eq!(right.width, u16::try_from(UnicodeWidthStr::width(right_text)).unwrap());
-        assert_eq!(left.width + FOOTER_COLUMN_GAP + right.width, 80);
+    fn footer_row_widths_left_gets_minimum() {
+        let (left, right) = footer_row_widths(80, Some("1 PEND. PERM."), 24);
+        assert_eq!(left + FOOTER_COLUMN_GAP + right, 80);
+        assert!(left >= 24);
     }
 
     #[test]
-    fn split_footer_columns_hint_zero_width() {
-        let area = Rect::new(0, 0, 0, 1);
-        let (left, right) = split_footer_columns_hint(area, Some("hint"), 24);
-        assert_eq!(left.width, 0);
-        assert_eq!(right.width, 0);
-    }
-
-    #[test]
-    fn split_footer_columns_hint_drops_right_when_left_min_cannot_be_preserved() {
-        let area = Rect::new(0, 0, 24, 1);
-        let (left, right) = split_footer_columns_hint(area, Some("1 MCP NEEDS AUTH"), 24);
-        assert_eq!(left.width, 24);
-        assert_eq!(right.width, 0);
+    fn footer_row_widths_drops_right_when_left_min_cannot_be_preserved() {
+        let (left, right) = footer_row_widths(24, Some("1 MCP NEEDS AUTH"), 24);
+        assert_eq!(left, 24);
+        assert_eq!(right, 0);
     }
 
     #[test]
@@ -455,14 +489,6 @@ mod tests {
         let fitted = fit_footer_right_text(text, 12).expect("fitted text");
         assert!(fitted.ends_with("..."));
         assert!(UnicodeWidthStr::width(fitted.as_str()) <= 12);
-    }
-
-    #[test]
-    fn fit_footer_right_text_keeps_prefix() {
-        let text = "Compacting context now and applying update hint";
-        let fitted = fit_footer_right_text(text, 20).expect("fitted text");
-        assert!(fitted.starts_with("Compacting"));
-        assert!(UnicodeWidthStr::width(fitted.as_str()) <= 20);
     }
 
     #[test]
@@ -475,13 +501,46 @@ mod tests {
     }
 
     #[test]
-    fn footer_primary_hint_none_without_pending_permission() {
+    fn serialize_footer_rows_produces_exactly_two_rows() {
         let app = App::test_default();
-        assert_eq!(footer_primary_hint(&app), None);
+        let serialized = serialize_footer_rows(&app, 80);
+
+        assert_eq!(serialized.rows.len(), 2);
     }
 
     #[test]
-    fn footer_primary_hint_shows_pending_permission_count() {
+    fn first_row_preserves_mode_and_fast_mode_badges() {
+        let app = app_with_mode();
+        let serialized = serialize_footer_rows(&app, 80);
+        let text = line_text(&serialized.rows[0]);
+
+        assert!(text.contains("[default]"));
+        assert!(text.contains("[FAST:OFF]"));
+    }
+
+    #[test]
+    fn first_row_omits_connecting_badge_when_mode_is_unset() {
+        let mut app = App::test_default();
+        app.status = AppStatus::Connecting;
+
+        let serialized = serialize_footer_rows(&app, 80);
+        let text = line_text(&serialized.rows[0]);
+
+        assert!(!text.contains("[CONNECTING]"));
+        assert!(text.contains("[FAST:OFF]"));
+    }
+
+    #[test]
+    fn second_row_preserves_context_line_content() {
+        let app = App::test_default();
+        let serialized = serialize_footer_rows(&app, 80);
+        let text = line_text(&serialized.rows[1]);
+
+        assert!(text.contains("Loc:"));
+    }
+
+    #[test]
+    fn pending_permission_hint_wins_on_first_row() {
         let mut app = App::test_default();
         let (response_tx, _response_rx) = oneshot::channel();
         app.messages.push(ChatMessage::new(
@@ -503,12 +562,6 @@ mod tests {
                 terminal_output_len: 0,
                 terminal_bytes_seen: 0,
                 terminal_snapshot_mode: TerminalSnapshotMode::AppendOnly,
-                render_epoch: 0,
-                layout_epoch: 0,
-                last_measured_width: 0,
-                last_measured_height: 0,
-                last_measured_layout_epoch: 0,
-                last_measured_layout_generation: 0,
                 cache: BlockCache::default(),
                 pending_permission: Some(InlinePermission {
                     options: vec![],
@@ -524,182 +577,57 @@ mod tests {
         app.index_tool_call("perm-1".into(), 0, 0);
         app.pending_interaction_ids.push("perm-1".into());
 
-        assert_eq!(footer_primary_hint(&app), Some(("1 PEND. PERM.".to_owned(), Color::Yellow)));
+        let serialized = serialize_footer_rows(&app, 80);
+        let text = line_text(&serialized.rows[0]);
+        assert!(text.contains("1 PEND. PERM."));
     }
 
     #[test]
-    fn fast_mode_badge_maps_cooldown_to_cd() {
-        let (label, _) = fast_mode_badge(model::FastModeState::Cooldown);
-        assert_eq!(label, "FAST:CD");
-    }
-
-    #[test]
-    fn mode_color_handles_auto_explicitly() {
-        assert_eq!(mode_color("auto"), Color::Yellow);
-    }
-
-    #[test]
-    fn footer_model_badge_uses_resolved_model_and_effort() {
-        let mut app = App::test_default();
-        app.current_model = Some(
-            model::CurrentModel::new("claude-sonnet-4-7", "Sonnet 4.7", "Sonnet 4.7")
-                .supports_effort(true)
-                .supported_effort_levels(vec![
-                    model::EffortLevel::Low,
-                    model::EffortLevel::Medium,
-                    model::EffortLevel::High,
-                ])
-                .authoritative(true),
-        );
-
-        assert_eq!(footer_model_badge(&app), Some("Sonnet 4.7/Med".to_owned()));
-    }
-
-    #[test]
-    fn footer_model_badge_hides_effort_for_models_without_support() {
-        let mut app = App::test_default();
-        app.current_model = Some(
-            model::CurrentModel::new("claude-haiku-4-5", "Haiku 4.5", "Haiku 4.5")
-                .authoritative(true),
-        );
-
-        assert_eq!(footer_model_badge(&app), Some("Haiku 4.5".to_owned()));
-    }
-
-    #[test]
-    fn footer_model_badge_falls_back_to_runtime_name_for_unknown_model() {
-        let mut app = App::test_default();
-        app.current_model = None;
-        assert_eq!(footer_model_badge(&app), None);
-
-        app.current_model = Some(
-            model::CurrentModel::new("unknown-model", "unknown-model", "unknown-model")
-                .authoritative(true),
-        );
-        assert_eq!(footer_model_badge(&app), Some("unknown-model".to_owned()));
-    }
-
-    #[test]
-    fn context_line_includes_loc_only_without_branch() {
-        let mut app = App::test_default();
-        app.cwd = "~/repo".into();
-
-        let text: String =
-            build_context_line(&app, 80).spans.iter().map(|span| span.content.as_ref()).collect();
-        assert_eq!(text, "Loc: ~/repo");
-    }
-
-    #[test]
-    fn context_line_includes_branch_when_present() {
-        let mut app = App::test_default();
-        app.cwd = "~/repo".into();
-        app.set_git_branch_for_test(Some("main"));
-
-        let text: String =
-            build_context_line(&app, 80).spans.iter().map(|span| span.content.as_ref()).collect();
-        assert_eq!(text, "Loc: ~/repo (main)");
-    }
-
-    #[test]
-    fn context_line_shortens_location_before_dropping_branch() {
-        let mut app = App::test_default();
-        app.cwd = "~/work/company/claude_rust".into();
-        app.set_git_branch_for_test(Some("feature/footer"));
-
-        let text: String =
-            build_context_line(&app, 46).spans.iter().map(|span| span.content.as_ref()).collect();
-        assert!(text.contains("(feature/footer)"));
-        assert!(text.starts_with("Loc: "));
-        assert!(!text.contains("~/work/company/claude_rust"));
-    }
-
-    #[test]
-    fn context_line_drops_branch_when_width_is_too_tight() {
-        let mut app = App::test_default();
-        app.cwd = "~/work/company/claude_rust".into();
-        app.set_git_branch_for_test(Some("feature/footer"));
-
-        let text: String =
-            build_context_line(&app, 24).spans.iter().map(|span| span.content.as_ref()).collect();
-        assert!(text.starts_with("Loc: "));
-        assert!(!text.contains("Branch:"));
-    }
-
-    #[test]
-    fn mcp_auth_hint_shows_needs_auth_count_before_real_chat() {
-        let mut app = App::test_default();
-        app.messages.push(ChatMessage::new(
-            MessageRole::Welcome,
-            vec![MessageBlock::Text(TextBlock::from_complete("welcome"))],
-            None,
-        ));
-        app.mcp.servers.push(McpServerStatus {
-            name: "calendar".into(),
-            status: McpServerConnectionStatus::NeedsAuth,
-            server_info: None,
-            error: None,
-            config: None,
-            scope: None,
-            tools: vec![],
-        });
-
-        assert_eq!(
-            footer_mcp_auth_hint(&app),
-            Some(("1 MCP NEEDS AUTH".to_owned(), Color::Yellow))
-        );
-    }
-
-    #[test]
-    fn mcp_auth_hint_hides_after_assistant_message() {
-        let mut app = App::test_default();
-        app.messages.push(ChatMessage::new(
-            MessageRole::Assistant,
-            vec![MessageBlock::Text(TextBlock::from_complete("hello"))],
-            None,
-        ));
-        app.mcp.servers.push(McpServerStatus {
-            name: "calendar".into(),
-            status: McpServerConnectionStatus::NeedsAuth,
-            server_info: None,
-            error: None,
-            config: None,
-            scope: None,
-            tools: vec![],
-        });
-
-        assert_eq!(footer_mcp_auth_hint(&app), None);
-    }
-
-    #[test]
-    fn footer_context_usage_hint_shows_percentage_only() {
+    fn mcp_auth_hint_wins_over_context_usage_on_second_row() {
         let mut app = App::test_default();
         app.session_usage.context_usage_percent = Some(62);
-
-        assert_eq!(footer_context_usage_hint(&app), Some(("38%".to_owned(), FOOTER_CONTEXT_VALUE)));
-    }
-
-    #[test]
-    fn footer_secondary_hint_prefers_mcp_auth_over_context_usage() {
-        let mut app = App::test_default();
-        app.session_usage.context_usage_percent = Some(62);
-        app.messages.push(ChatMessage::new(
-            MessageRole::Welcome,
-            vec![MessageBlock::Text(TextBlock::from_complete("welcome"))],
-            None,
-        ));
         app.mcp.servers.push(McpServerStatus {
-            name: "calendar".into(),
+            name: "filesystem".to_owned(),
             status: McpServerConnectionStatus::NeedsAuth,
             server_info: None,
             error: None,
             config: None,
             scope: None,
-            tools: vec![],
+            tools: Vec::new(),
         });
 
-        assert_eq!(
-            footer_secondary_hint(&app),
-            Some(("1 MCP NEEDS AUTH".to_owned(), Color::Yellow))
-        );
+        let serialized = serialize_footer_rows(&app, 80);
+        let text = line_text(&serialized.rows[1]);
+        assert!(text.contains("1 MCP NEEDS AUTH"));
+        assert!(!text.contains("38%"));
+    }
+
+    #[test]
+    fn narrow_width_truncates_right_hint_but_preserves_left_content() {
+        let mut app = App::test_default();
+        app.mcp.servers.push(McpServerStatus {
+            name: "filesystem".to_owned(),
+            status: McpServerConnectionStatus::NeedsAuth,
+            server_info: None,
+            error: None,
+            config: None,
+            scope: None,
+            tools: Vec::new(),
+        });
+
+        let serialized = serialize_footer_rows(&app, 36);
+        let text = line_text(&serialized.rows[1]);
+        assert!(text.contains("Loc:"));
+        assert!(text.contains("..."));
+    }
+
+    #[test]
+    fn context_location_and_branch_truncation_matches_helpers() {
+        let mut app = App::test_default();
+        app.set_git_branch_for_test(Some("feature/footer"));
+
+        let serialized = serialize_footer_rows(&app, 24);
+        let text = line_text(&serialized.rows[1]);
+        assert!(text.contains("Loc:"));
     }
 }

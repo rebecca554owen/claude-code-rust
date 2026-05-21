@@ -6,23 +6,70 @@ use super::tool_call_info::ToolCallInfo;
 use super::types::MessageUsage;
 use ratatui::style::Color;
 use ratatui::text::Line;
-use std::cell::Cell;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+static NEXT_TRANSCRIPT_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_transcript_id() -> u64 {
+    NEXT_TRANSCRIPT_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ChatMessageId(u64);
+
+impl ChatMessageId {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(next_transcript_id())
+    }
+}
+
+impl Default for ChatMessageId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MessageBlockId(u64);
+
+impl MessageBlockId {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(next_transcript_id())
+    }
+}
+
+impl Default for MessageBlockId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum HistoryOutputId {
+    Message(ChatMessageId),
+    AssistantLabel(ChatMessageId),
+    AssistantIndicator(ChatMessageId),
+    Block(MessageBlockId),
+    ToolCall(String),
+}
+
 pub struct ChatMessage {
+    pub id: ChatMessageId,
     pub role: MessageRole,
     pub blocks: Vec<MessageBlock>,
     pub usage: Option<MessageUsage>,
-    pub render_cache: MessageRenderCache,
 }
 
 impl ChatMessage {
     #[must_use]
     pub fn new(role: MessageRole, blocks: Vec<MessageBlock>, usage: Option<MessageUsage>) -> Self {
-        Self { role, blocks, usage, render_cache: MessageRenderCache::default() }
+        Self { id: ChatMessageId::new(), role, blocks, usage }
     }
 
     #[must_use]
@@ -30,6 +77,7 @@ impl ChatMessage {
         Self::new(
             MessageRole::Welcome,
             vec![MessageBlock::Welcome(WelcomeBlock {
+                id: MessageBlockId::new(),
                 version: version.to_owned(),
                 subscription: subscription.to_owned(),
                 cwd: cwd.to_owned(),
@@ -39,158 +87,6 @@ impl ChatMessage {
             })],
             None,
         )
-    }
-
-    pub fn invalidate_render_cache(&mut self) {
-        self.render_cache.invalidate();
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MessageRenderCacheKey {
-    pub width: u16,
-    pub layout_generation: u64,
-    pub tools_collapsed: bool,
-    pub include_trailing_separator: bool,
-    pub render_signature: MessageRenderSignature,
-}
-
-#[allow(clippy::struct_excessive_bools)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MessageRenderSignature {
-    pub role: MessageRole,
-    pub show_empty_thinking: bool,
-    pub show_thinking: bool,
-    pub show_compacting: bool,
-    pub assistant_frame: Option<usize>,
-    pub blocks: Vec<MessageBlockRenderSignature>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MessageBlockRenderSignature {
-    Text {
-        text_hash: u64,
-        trailing_spacing: TextBlockSpacing,
-    },
-    Notice {
-        severity: SystemSeverity,
-        text_hash: u64,
-        trailing_spacing: TextBlockSpacing,
-    },
-    ToolCall {
-        render_epoch: u64,
-        layout_epoch: u64,
-        hidden: bool,
-        status: crate::agent::model::ToolCallStatus,
-        sdk_tool_name: String,
-        current_mode_id: Option<String>,
-        pending_permission: bool,
-        pending_question: bool,
-        frame: Option<usize>,
-    },
-    Welcome {
-        content_hash: u64,
-    },
-    ImageAttachment {
-        count: usize,
-    },
-}
-
-#[derive(Default)]
-pub struct MessageRenderCache {
-    key: Option<MessageRenderCacheKey>,
-    segments: Vec<CachedMessageSegment>,
-    cached_bytes: usize,
-    height: usize,
-    wrapped_lines: usize,
-    last_access_tick: Cell<u64>,
-}
-
-#[derive(Clone)]
-pub enum CachedMessageSegment {
-    Blank,
-    Lines { lines: Vec<Line<'static>>, height: usize },
-}
-
-impl MessageRenderCache {
-    fn touch(&self) {
-        self.last_access_tick.set(super::block_cache::next_cache_access_tick());
-    }
-
-    #[must_use]
-    pub fn matches(&self, key: &MessageRenderCacheKey) -> bool {
-        self.key.as_ref() == Some(key)
-    }
-
-    #[must_use]
-    pub fn segments(&self) -> &[CachedMessageSegment] {
-        self.touch();
-        &self.segments
-    }
-
-    #[must_use]
-    pub fn height(&self) -> usize {
-        self.touch();
-        self.height
-    }
-
-    #[must_use]
-    pub fn wrapped_lines(&self) -> usize {
-        self.touch();
-        self.wrapped_lines
-    }
-
-    #[must_use]
-    pub fn cached_bytes(&self) -> usize {
-        self.cached_bytes
-    }
-
-    #[must_use]
-    pub fn last_access_tick(&self) -> u64 {
-        self.last_access_tick.get()
-    }
-
-    pub fn store(
-        &mut self,
-        key: MessageRenderCacheKey,
-        segments: Vec<CachedMessageSegment>,
-        height: usize,
-        wrapped_lines: usize,
-    ) {
-        let cached_bytes = segments.iter().map(CachedMessageSegment::cached_bytes).sum();
-        self.key = Some(key);
-        self.segments = segments;
-        self.cached_bytes = cached_bytes;
-        self.height = height;
-        self.wrapped_lines = wrapped_lines;
-        self.touch();
-    }
-
-    pub fn invalidate(&mut self) {
-        self.key = None;
-        self.segments.clear();
-        self.cached_bytes = 0;
-        self.height = 0;
-        self.wrapped_lines = 0;
-    }
-
-    pub fn evict_cached_render(&mut self) -> usize {
-        let removed = self.cached_bytes;
-        if removed == 0 {
-            return 0;
-        }
-        self.invalidate();
-        removed
-    }
-}
-
-impl CachedMessageSegment {
-    #[must_use]
-    fn cached_bytes(&self) -> usize {
-        match self {
-            Self::Blank => 1,
-            Self::Lines { lines, .. } => lines.iter().map(line_utf8_bytes).sum(),
-        }
     }
 }
 
@@ -217,12 +113,6 @@ fn random_welcome_tip_seed() -> u64 {
     let mut hasher = DefaultHasher::new();
     SystemTime::now().duration_since(UNIX_EPOCH).ok().hash(&mut hasher);
     hasher.finish()
-}
-
-fn line_utf8_bytes(line: &Line<'static>) -> usize {
-    let span_bytes =
-        line.spans.iter().fold(0usize, |acc, span| acc.saturating_add(span.content.len()));
-    span_bytes.saturating_add(1)
 }
 
 /// Text holder for a single message block's markdown source.
@@ -419,6 +309,7 @@ impl TextBlockSpacing {
 }
 
 pub struct TextBlock {
+    pub id: MessageBlockId,
     pub text: String,
     pub cache: BlockCache,
     pub markdown: IncrementalMarkdown,
@@ -434,7 +325,13 @@ pub struct TextBlock {
 impl TextBlock {
     #[must_use]
     pub fn new(text: String) -> Self {
+        Self::new_with_id(MessageBlockId::new(), text)
+    }
+
+    #[must_use]
+    pub fn new_with_id(id: MessageBlockId, text: String) -> Self {
         Self {
+            id,
             markdown: IncrementalMarkdown::from_complete(&text),
             text,
             cache: BlockCache::default(),
@@ -472,6 +369,7 @@ pub enum NoticeDedupKey {
 }
 
 pub struct NoticeBlock {
+    pub id: MessageBlockId,
     pub severity: SystemSeverity,
     pub text: TextBlock,
     pub dedup_key: Option<NoticeDedupKey>,
@@ -480,7 +378,7 @@ pub struct NoticeBlock {
 impl NoticeBlock {
     #[must_use]
     pub fn new(severity: SystemSeverity, text: String) -> Self {
-        Self { severity, text: TextBlock::new(text), dedup_key: None }
+        Self { id: MessageBlockId::new(), severity, text: TextBlock::new(text), dedup_key: None }
     }
 
     #[must_use]
@@ -495,6 +393,7 @@ impl NoticeBlock {
     }
 
     pub fn replace_text(&mut self, text: &str) {
+        self.id = MessageBlockId::new();
         self.text = TextBlock::from_complete(text);
     }
 
@@ -518,6 +417,7 @@ pub enum MessageBlock {
 /// to satisfy the render-budget invariant that every [`MessageBlock`] variant
 /// has a cache, even though the cached content is trivially small.
 pub struct ImageAttachmentBlock {
+    pub id: MessageBlockId,
     pub count: usize,
     pub cache: BlockCache,
 }
@@ -525,7 +425,7 @@ pub struct ImageAttachmentBlock {
 impl ImageAttachmentBlock {
     #[must_use]
     pub fn new(count: usize) -> Self {
-        Self { count, cache: BlockCache::default() }
+        Self { id: MessageBlockId::new(), count, cache: BlockCache::default() }
     }
 }
 
@@ -545,6 +445,7 @@ pub enum SystemSeverity {
 }
 
 pub struct WelcomeBlock {
+    pub id: MessageBlockId,
     pub version: String,
     pub subscription: String,
     pub cwd: String,

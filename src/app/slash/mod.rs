@@ -9,27 +9,23 @@
 //! - `executors`: slash command execution handlers
 
 mod candidates;
+mod catalog;
 mod executors;
 mod navigation;
 
 use super::{
-    App, AppStatus, ChatMessage, MessageBlock, MessageRole, TextBlock, dialog::DialogState,
+    App, AppStatus, ChatMessage, MessageBlock, MessageRole, SystemSeverity, TextBlock,
+    dialog::DialogState,
 };
 use crate::agent::model;
+use crate::app::events::push_system_message_with_severity;
 use std::rc::Rc;
 
-pub const MAX_VISIBLE: usize = 8;
 const MAX_CANDIDATES: usize = 50;
-const DOCS_TOPICS: [(&str, &str); 5] = [
-    ("mode", "Show current and available session modes"),
-    ("models", "Show advertised models and capabilities"),
-    ("shortcuts", "Show live keyboard shortcuts for the current app state"),
-    ("commands", "Show app and SDK slash commands"),
-    ("agents", "Show advertised subagents"),
-];
-
 // Re-export public API
+pub(crate) use catalog::{APP_SLASH_COMMANDS, AppSlashCommand, command_spec};
 pub use executors::try_handle_submit;
+#[allow(unused_imports)]
 pub use navigation::{
     activate, confirm_selection, deactivate, move_down, move_up, sync_with_cursor, update_query,
 };
@@ -96,13 +92,7 @@ fn normalize_slash_name(name: &str) -> String {
 
 fn push_system_message(app: &mut App, text: impl Into<String>) {
     let text = text.into();
-    app.push_message_tracked(ChatMessage::new(
-        MessageRole::System(None),
-        vec![MessageBlock::Text(TextBlock::from_complete(&text))],
-        None,
-    ));
-    app.enforce_history_retention_tracked();
-    app.viewport.engage_auto_scroll();
+    push_system_message_with_severity(app, Some(SystemSeverity::Error), &text);
 }
 
 fn push_user_message(app: &mut App, text: impl Into<String>) {
@@ -113,7 +103,6 @@ fn push_user_message(app: &mut App, text: impl Into<String>) {
         None,
     ));
     app.enforce_history_retention_tracked();
-    app.viewport.engage_auto_scroll();
 }
 
 fn require_connection(
@@ -184,8 +173,9 @@ mod tests {
     #[test]
     fn advertised_command_is_forwarded() {
         let mut app = App::test_default();
-        app.available_commands = vec![model::AvailableCommand::new("/help", "Help")];
-        let consumed = try_handle_submit(&mut app, "/help");
+        app.available_commands =
+            vec![model::AvailableCommand::new("/remote-command", "Remote command")];
+        let consumed = try_handle_submit(&mut app, "/remote-command");
         assert!(!consumed);
     }
 
@@ -206,6 +196,14 @@ mod tests {
     }
 
     #[test]
+    fn app_slash_catalog_roundtrips_command_names() {
+        for spec in APP_SLASH_COMMANDS {
+            assert_eq!(AppSlashCommand::from_name(spec.name), Some(spec.command));
+            assert_eq!(spec.command.name(), spec.name);
+        }
+    }
+
+    #[test]
     fn config_without_args_opens_settings_view() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = App::test_default();
@@ -214,7 +212,26 @@ mod tests {
         let consumed = try_handle_submit(&mut app, "/config");
 
         assert!(consumed);
-        assert_eq!(app.active_view, super::super::ActiveView::Config);
+        assert_eq!(
+            app.surface_mode,
+            super::super::SurfaceMode::Fullscreen(super::super::FullscreenView::Config)
+        );
+    }
+
+    #[test]
+    fn help_without_args_opens_help_tab() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = App::test_default();
+        app.settings_home_override = Some(dir.path().to_path_buf());
+
+        let consumed = try_handle_submit(&mut app, "/help");
+
+        assert!(consumed);
+        assert_eq!(
+            app.surface_mode,
+            super::super::SurfaceMode::Fullscreen(super::super::FullscreenView::Config)
+        );
+        assert_eq!(app.config.active_tab, super::super::ConfigTab::Help);
     }
 
     #[test]
@@ -541,7 +558,10 @@ mod tests {
         let consumed = try_handle_submit(&mut app, "/plugins");
 
         assert!(consumed);
-        assert_eq!(app.active_view, super::super::ActiveView::Config);
+        assert_eq!(
+            app.surface_mode,
+            super::super::SurfaceMode::Fullscreen(super::super::FullscreenView::Config)
+        );
         assert_eq!(app.config.active_tab, super::super::ConfigTab::Plugins);
     }
 
@@ -554,7 +574,10 @@ mod tests {
         let consumed = try_handle_submit(&mut app, "/mcp");
 
         assert!(consumed);
-        assert_eq!(app.active_view, super::super::ActiveView::Config);
+        assert_eq!(
+            app.surface_mode,
+            super::super::SurfaceMode::Fullscreen(super::super::FullscreenView::Config)
+        );
         assert_eq!(app.config.active_tab, super::super::ConfigTab::Mcp);
     }
 
@@ -583,7 +606,10 @@ mod tests {
         let consumed = try_handle_submit(&mut app, "/plugins extra");
 
         assert!(consumed);
-        assert_eq!(app.active_view, super::super::ActiveView::Config);
+        assert_eq!(
+            app.surface_mode,
+            super::super::SurfaceMode::Fullscreen(super::super::FullscreenView::Config)
+        );
         assert_eq!(app.config.active_tab, super::super::ConfigTab::Plugins);
     }
 
@@ -778,20 +804,22 @@ mod tests {
             panic!("expected text block");
         };
         assert!(block.text.contains("| Command | Description |"));
+        assert!(block.text.contains("/1m-context"));
+        assert!(block.text.contains("project-local 1M context"));
+        assert!(block.text.contains("/cancel"));
+        assert!(block.text.contains("/compact"));
         assert!(block.text.contains("/config"));
         assert!(block.text.contains("/docs"));
         assert!(block.text.contains("/help"));
+        assert!(block.text.contains("/mode"));
+        assert!(block.text.contains("/model"));
+        assert!(block.text.contains("/new-session"));
+        assert!(block.text.contains("/resume"));
     }
 
     #[test]
     fn docs_shortcuts_use_live_help_state() {
         let mut app = App::test_default();
-        app.show_todo_panel = true;
-        app.todos.push(crate::app::TodoItem {
-            content: "Task".into(),
-            status: crate::app::TodoStatus::Pending,
-            active_form: String::new(),
-        });
 
         let consumed = try_handle_submit(&mut app, "/docs shortcuts");
 
@@ -801,7 +829,8 @@ mod tests {
             panic!("expected text block");
         };
         assert!(block.text.contains("| Shortcut | Action |"));
-        assert!(block.text.contains("Toggle todo focus"));
+        assert!(block.text.contains("Send message"));
+        assert!(!block.text.contains("Toggle todo"));
     }
 
     #[test]
@@ -843,7 +872,7 @@ mod tests {
     }
 
     #[test]
-    fn variable_command_argument_mode_deactivates_when_no_match() {
+    fn variable_command_argument_mode_stays_active_without_matches() {
         let mut app = App::test_default();
         app.mode = Some(super::super::ModeState {
             current_mode_id: "plan".to_owned(),
@@ -856,7 +885,9 @@ mod tests {
         app.input.set_text("/mode xyz");
         let _ = app.input.set_cursor(0, "/mode xyz".chars().count());
         sync_with_cursor(&mut app);
-        assert!(app.slash.is_none());
+        let slash =
+            app.slash.as_ref().expect("slash state should stay active for empty result hint");
+        assert!(slash.candidates.is_empty());
     }
 
     #[test]
@@ -1298,7 +1329,10 @@ mod tests {
         let consumed = try_handle_submit(&mut app, "/status");
 
         assert!(consumed);
-        assert_eq!(app.active_view, super::super::ActiveView::Config);
+        assert_eq!(
+            app.surface_mode,
+            super::super::SurfaceMode::Fullscreen(super::super::FullscreenView::Config)
+        );
         assert_eq!(app.config.active_tab, super::super::ConfigTab::Status);
     }
 
@@ -1311,7 +1345,10 @@ mod tests {
         let consumed = try_handle_submit(&mut app, "/usage");
 
         assert!(consumed);
-        assert_eq!(app.active_view, super::super::ActiveView::Config);
+        assert_eq!(
+            app.surface_mode,
+            super::super::SurfaceMode::Fullscreen(super::super::FullscreenView::Config)
+        );
         assert_eq!(app.config.active_tab, super::super::ConfigTab::Usage);
     }
 

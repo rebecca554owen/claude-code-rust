@@ -14,7 +14,7 @@ fn main() {
             eprintln!("{}", app_error.user_message());
             std::process::exit(app_error.exit_code());
         }
-        eprintln!("{err}");
+        eprintln!("{err:#}");
         std::process::exit(1);
     }
 }
@@ -66,7 +66,6 @@ fn run() -> anyhow::Result<()> {
         // Phase 2: start non-session startup work + TUI.
         // The bridge itself is started from the TUI loop only after trust is accepted.
         claude_code_rust::app::start_update_check(&app, &cli);
-        claude_code_rust::app::start_service_status_check(&app);
         let result = claude_code_rust::app::run_tui(&mut app).await;
         maybe_print_resume_hint(&app, result.is_ok());
 
@@ -92,5 +91,35 @@ fn maybe_print_resume_hint(app: &claude_code_rust::app::App, success: bool) {
     let Some(session_id) = app.session_id.as_ref() else {
         return;
     };
-    eprintln!("Resume this session: claude-rs resume {session_id}");
+    let mut stderr = std::io::stderr().lock();
+    if let Err(err) = write_resume_hint(&mut stderr, session_id) {
+        tracing::warn!(
+            target: claude_code_rust::logging::targets::APP_LIFECYCLE,
+            event_name = "resume_hint_write_failed",
+            message = "failed to write resume hint",
+            outcome = "failure",
+            error_message = %err,
+        );
+    }
+}
+
+fn write_resume_hint(
+    mut writer: impl std::io::Write,
+    session_id: impl std::fmt::Display,
+) -> std::io::Result<()> {
+    writeln!(writer, "\r\nResume this session: claude-rs resume {session_id}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_resume_hint;
+
+    #[test]
+    fn resume_hint_starts_on_fresh_line_and_ends_with_newline() {
+        let mut output = Vec::new();
+
+        assert!(write_resume_hint(&mut output, "abc-123").is_ok());
+
+        assert_eq!(output, b"\r\nResume this session: claude-rs resume abc-123\n");
+    }
 }

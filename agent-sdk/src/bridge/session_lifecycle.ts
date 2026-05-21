@@ -46,6 +46,7 @@ import {
   ensureToolCallVisible,
   setToolCallStatus,
 } from "./tool_calls.js";
+import { isToolSearchToolName } from "./tooling.js";
 import {
   requestExitPlanModeApproval,
   requestAskUserQuestionAnswers,
@@ -56,6 +57,12 @@ import { mapAvailableAgents, emitAvailableAgentsIfChanged, refreshAvailableAgent
 import { emitAuthRequired, emitFastModeUpdateIfChanged } from "./error_classification.js";
 
 export type ConnectEventKind = "connected" | "session_replaced";
+
+const BRIDGE_RUNTIME_PROCESS_NAME =
+  process.platform === "win32" ? "claude-rs-bridge-node.exe" : "claude-rs-bridge-node";
+const BRIDGE_RUNTIME_GUARD_PROMPT =
+  `Do not terminate the Claude Rust bridge runtime process \`${BRIDGE_RUNTIME_PROCESS_NAME}\`; ` +
+  "when cleaning up development servers, only stop processes by explicit PIDs you started in this session.";
 
 function permissionDisplayFromCanUseOptions(
   options: Parameters<CanUseTool>[2],
@@ -120,6 +127,7 @@ export type SessionState = {
   pendingQuestions: Map<string, PendingQuestion>;
   pendingElicitations: Map<string, PendingElicitation>;
   mcpStatusRevalidatedAt: Map<string, number>;
+  hiddenToolUseIds: Set<string>;
   authHintSent: boolean;
   lastAvailableAgentsSignature?: string;
   lastAssistantError?: string;
@@ -399,6 +407,10 @@ export async function createSession(params: {
   const sessionIdForLogs = () => session?.sessionId ?? provisionalSessionId;
   const canUseTool: CanUseTool = async (toolName, inputData, options) => {
     const toolUseId = options.toolUseID;
+    if (isToolSearchToolName(toolName)) {
+      session?.hiddenToolUseIds.add(toolUseId);
+      return { behavior: "allow", updatedInput: inputData, toolUseID: toolUseId };
+    }
     if (toolName === EXIT_PLAN_MODE_TOOL_NAME) {
       const existing = ensureToolCallVisible(session, toolUseId, toolName, inputData);
       return await requestExitPlanModeApproval(session, toolUseId, inputData, existing);
@@ -533,6 +545,7 @@ export async function createSession(params: {
     pendingQuestions: new Map<string, PendingQuestion>(),
     pendingElicitations: new Map<string, PendingElicitation>(),
     mcpStatusRevalidatedAt: new Map<string, number>(),
+    hiddenToolUseIds: new Set<string>(),
     authHintSent: false,
     ...(params.resumeUpdates && params.resumeUpdates.length > 0
       ? { resumeUpdates: params.resumeUpdates }
@@ -821,24 +834,25 @@ function startupPermissionModeOptions(
 
 function systemPromptFromLaunchSettings(
   launchSettings: SessionLaunchSettings,
-):
-  | {
-      type: "preset";
-      preset: "claude_code";
-      append: string;
-    }
-  | undefined {
+): {
+  type: "preset";
+  preset: "claude_code";
+  append: string;
+} {
   const language = launchSettings.language?.trim();
-  if (!language) {
-    return undefined;
+  const appendLines = [BRIDGE_RUNTIME_GUARD_PROMPT];
+
+  if (language) {
+    appendLines.push(
+      `Always respond to the user in ${language} unless the user explicitly asks for a different language. ` +
+        `Keep code, shell commands, file paths, API names, tool names, and raw error text unchanged unless the user explicitly asks for translation.`,
+    );
   }
 
   return {
     type: "preset",
     preset: "claude_code",
-    append:
-      `Always respond to the user in ${language} unless the user explicitly asks for a different language. ` +
-      `Keep code, shell commands, file paths, API names, tool names, and raw error text unchanged unless the user explicitly asks for translation.`,
+    append: appendLines.join(" "),
   };
 }
 
@@ -857,7 +871,7 @@ export function buildQueryOptions(params: QueryOptionsBuilderParams) {
     ...modelOption,
     ...permissionModeOptions,
     toolConfig: { askUserQuestion: { previewFormat: "markdown" as const } },
-    ...(systemPrompt ? { systemPrompt } : {}),
+    systemPrompt,
     ...(params.launchSettings.agent_progress_summaries !== undefined
       ? { agentProgressSummaries: params.launchSettings.agent_progress_summaries }
       : {}),
